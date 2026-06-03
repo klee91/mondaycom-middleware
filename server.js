@@ -1,34 +1,26 @@
 /**
  * Monday.com Email Template Generator — Backend Server
- * 
- * Stack:  Node.js + Express
- * Deploy: Render / Railway / Vercel / any Node host
- * 
- * Required env vars:
- *   MONDAY_API_TOKEN   — Monday.com API token (Admin → API)
- *   ANTHROPIC_API_KEY  — Anthropic API key
- *   PORT               — (optional) defaults to 3000
- *   ALLOWED_ORIGIN     — (optional) CORS origin, e.g. https://claude.ai
+ * Node.js + Express (CommonJS)
  */
 
-import express from "express";
-import cors from "cors";
-import fetch from "node-fetch";
-import FormData from "form-data";
-import Anthropic from "@anthropic-ai/sdk";
+const express    = require("express");
+const cors       = require("cors");
+const fetch      = require("node-fetch");
+const FormData   = require("form-data");
+const Anthropic  = require("@anthropic-ai/sdk");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
-app.use(cors({ origin: process.env.ALLOWED_ORIGIN || "*" }));
+app.use(cors({ origin: "*" }));
 
 const MONDAY_API_URL = "https://api.monday.com/v2";
 const MONDAY_FILE_URL = "https://api.monday.com/v2/file";
-const BOARD_ID       = "2120641399";
+const BOARD_ID        = "2120641399";
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const anthropic = new Anthropic.default({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 // ─────────────────────────────────────────────
-// Helper: call Monday GraphQL API
+// Helper: Monday GraphQL
 // ─────────────────────────────────────────────
 async function mondayQuery(query, variables = {}) {
   const res = await fetch(MONDAY_API_URL, {
@@ -46,22 +38,30 @@ async function mondayQuery(query, variables = {}) {
 }
 
 // ─────────────────────────────────────────────
-// GET /api/tickets — fetch New Requests group
+// Root + health
+// ─────────────────────────────────────────────
+app.get("/", (_, res) => res.json({ status: "ok", service: "Monday Email Generator API" }));
+app.get("/health", (_, res) => res.json({ status: "ok" }));
+
+// ─────────────────────────────────────────────
+// GET /api/tickets
 // ─────────────────────────────────────────────
 app.get("/api/tickets", async (req, res) => {
   try {
     const data = await mondayQuery(`
-      query GetNewRequests($boardId: ID!) {
+      query GetGroups($boardId: ID!) {
         boards(ids: [$boardId]) {
           groups {
-            id title
+            id
+            title
             items_page(limit: 50) {
               items {
-                id name
+                id
+                name
                 column_values(ids: [
                   "status", "long_text7", "text86", "formula",
-                  "date4", "date_mkx4g1zc", "dropdown3", "status_1",
-                  "dropdown2", "person", "files"
+                  "date4", "date_mkx4g1zc", "dropdown3",
+                  "status_1", "dropdown2", "person", "files"
                 ]) {
                   id text value
                 }
@@ -73,33 +73,29 @@ app.get("/api/tickets", async (req, res) => {
     `, { boardId: BOARD_ID });
 
     const allGroups = data?.boards?.[0]?.groups ?? [];
-
-    // Match any group whose title contains "new request" (case-insensitive)
-    // Falls back to all groups if none found, so the app still works
-    const matchedGroups = allGroups.filter(g =>
+    const matched   = allGroups.filter(g =>
       g.title.toLowerCase().includes("new request")
     );
-    const groups = matchedGroups.length > 0 ? matchedGroups : allGroups;
+    const groups = matched.length > 0 ? matched : allGroups;
     const items  = groups.flatMap(g => g.items_page?.items ?? []);
 
-    // Normalize column_values array → flat object
     const tickets = items.map(item => {
       const cols = {};
       for (const cv of item.column_values) cols[cv.id] = cv.text ?? cv.value;
       return {
         id:          item.id,
         name:        item.name,
-        status:      cols["status"]           ?? "",
-        description: cols["long_text7"]        ?? "",
-        subjectLine: cols["text86"]            ?? "",
-        jobNumber:   cols["formula"]           ?? "",
-        sendDate:    cols["date4"]             ?? "",
-        contentDue:  cols["date_mkx4g1zc"]    ?? "",
-        type:        cols["dropdown3"]         ?? "",
-        category:    cols["status_1"]          ?? "",
-        product:     cols["dropdown2"]         ?? "",
-        requestor:   cols["person"]            ?? "",
-        hasFiles:    cols["files"] !== null && cols["files"] !== "",
+        status:      cols["status"]        ?? "",
+        description: cols["long_text7"]    ?? "",
+        subjectLine: cols["text86"]        ?? "",
+        jobNumber:   cols["formula"]       ?? "",
+        sendDate:    cols["date4"]         ?? "",
+        contentDue:  cols["date_mkx4g1zc"] ?? "",
+        type:        cols["dropdown3"]     ?? "",
+        category:    cols["status_1"]      ?? "",
+        product:     cols["dropdown2"]     ?? "",
+        requestor:   cols["person"]        ?? "",
+        hasFiles:    !!cols["files"],
       };
     });
 
@@ -111,7 +107,7 @@ app.get("/api/tickets", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-// POST /api/generate — generate HTML via Claude
+// POST /api/generate
 // ─────────────────────────────────────────────
 app.post("/api/generate", async (req, res) => {
   const { ticket, templateName, templateHtml } = req.body;
@@ -127,15 +123,15 @@ app.post("/api/generate", async (req, res) => {
 RULES:
 - Return ONLY the populated HTML. No explanation, no markdown, no code fences.
 - Keep ALL HTML structure, styles, images, and links completely intact.
-- CRITICAL: Any existing {{...}} or {{{...}}} tokens already present in the template are Pardot merge tags and must be left exactly as-is. Do NOT modify, replace, or remove them under any circumstances. Examples: {{Recipient.FirstName}}, {{{EmailPreferenceCenter_488}}}, {{Recipient.Custom_CPA_Domain}}.
-- Only replace these specific content placeholders that you insert yourself — do not treat them as Pardot tags:
-    BODY_CONTENT_HERE  → replace with email body copy written from the ticket description
-    BUTTON_TEXT        → replace with a relevant CTA based on the ticket context
-    JOB_NUMBER_HERE    → replace with the job number, or remove the line if blank
+- CRITICAL: Any existing {{...}} or {{{...}}} tokens already in the template are Pardot merge tags. Leave them exactly as-is. Do NOT modify, replace, or remove them. Examples: {{Recipient.FirstName}}, {{{EmailPreferenceCenter_488}}}, {{Subject}}.
+- Only replace these plain text placeholders:
+    BODY_CONTENT_HERE → email body copy based on the ticket description
+    BUTTON_TEXT       → a relevant CTA based on ticket context
+    JOB_NUMBER_HERE   → the job number, or remove the line if blank
 - Write body copy in a professional tone appropriate to the template and product.
-- If the description says "TBD" or "TBC", write placeholder-appropriate copy based on the subject line and product.`,
+- If description says TBD or TBC, write placeholder copy based on the subject line and product.`,
       messages: [{
-        role: "user",
+        role:    "user",
         content: `Ticket data:
 Name: ${ticket.name}
 Template: ${templateName}
@@ -152,7 +148,7 @@ ${templateHtml}`,
     });
 
     const html = message.content.find(b => b.type === "text")?.text ?? "";
-    if (!html) throw new Error("Claude returned no content.");
+    if (!html) throw new Error("No content returned from Claude.");
     res.json({ html });
   } catch (err) {
     console.error("POST /api/generate error:", err);
@@ -161,7 +157,7 @@ ${templateHtml}`,
 });
 
 // ─────────────────────────────────────────────
-// POST /api/upload — upload HTML file to Monday
+// POST /api/upload
 // ─────────────────────────────────────────────
 app.post("/api/upload", async (req, res) => {
   const { itemId, fileName, html } = req.body;
@@ -170,34 +166,23 @@ app.post("/api/upload", async (req, res) => {
   }
 
   try {
-    // Monday's file upload requires a multipart/form-data GraphQL request
     const query = `
       mutation AddFileToColumn($itemId: ID!, $columnId: String!, $file: File!) {
         add_file_to_column(item_id: $itemId, column_id: $columnId, file: $file) {
-          id
-          name
-          url
+          id name url
         }
       }
     `;
 
-    const variables = {
+    const form = new FormData();
+    form.append("query", query);
+    form.append("variables", JSON.stringify({
       itemId,
       columnId: "files",
-      file: null,  // placeholder — actual file goes in form-data map
-    };
-
-    // Build multipart form-data per the Monday file upload spec
-    // https://developer.monday.com/api-reference/docs/files
-    const form = new FormData();
-
-    form.append("query",     query);
-    form.append("variables", JSON.stringify(variables));
-
-    // "map" maps the multipart field "file" to the GraphQL variable path
+      file:     null,
+    }));
     form.append("map", JSON.stringify({ "0": ["variables.file"] }));
 
-    // Append the actual HTML file buffer
     const buf = Buffer.from(html, "utf-8");
     form.append("0", buf, {
       filename:    fileName,
@@ -216,28 +201,17 @@ app.post("/api/upload", async (req, res) => {
     });
 
     const uploadData = await uploadRes.json();
-
     if (uploadData.errors) {
       throw new Error(uploadData.errors.map(e => e.message).join(", "));
     }
 
     const asset = uploadData?.data?.add_file_to_column;
-    res.json({
-      success:  true,
-      assetId:  asset?.id,
-      fileName: asset?.name,
-      url:      asset?.url,
-    });
+    res.json({ success: true, assetId: asset?.id, fileName: asset?.name, url: asset?.url });
   } catch (err) {
     console.error("POST /api/upload error:", err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// ─────────────────────────────────────────────
-// Health check
-// ─────────────────────────────────────────────
-app.get("/health", (_, res) => res.json({ status: "ok" }));
-
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`✅  Server running on port ${PORT}`));
