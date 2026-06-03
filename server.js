@@ -7,7 +7,7 @@ const express    = require("express");
 const cors       = require("cors");
 const fetch      = require("node-fetch");
 const FormData   = require("form-data");
-const Anthropic  = require("@anthropic-ai/sdk");
+const Anthropic  = require("@anthropic-ai/sdk").default;
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -15,9 +15,9 @@ app.use(cors({ origin: "*" }));
 
 const MONDAY_API_URL = "https://api.monday.com/v2";
 const MONDAY_FILE_URL = "https://api.monday.com/v2/file";
-const BOARD_ID        = "2120641399";
+const BOARD_ID        = process.env.BOARD_ID;
 
-const anthropic = new Anthropic.default({ apiKey: process.env.ANTHROPIC_API_KEY });
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 // ─────────────────────────────────────────────
 // Helper: Monday GraphQL
