@@ -119,8 +119,6 @@ app.post("/api/generate", async (req, res) => {
       system: `You are an email template generator. Populate the HTML template with ticket data.
 RULES:
 - Return ONLY the populated HTML. No explanation, no markdown, no code fences.
-- Replace {{Subject}} with the subject line.
-- Replace {{Recipient.FirstName}} with "there" if no name is provided.
 - Replace {{BodyContent}} with well-written email body copy based on the description.
 - Replace {{PreheaderText}} with a short preheader generated from the subject.
 - Replace {{SectionHeader}} with "Featured segments:" or an appropriate header.
