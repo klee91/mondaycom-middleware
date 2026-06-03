@@ -11,7 +11,12 @@ const Anthropic  = require("@anthropic-ai/sdk").default;
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
-app.use(cors({ origin: "*" }));
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+}));
+app.options("*", cors());
 
 const MONDAY_API_URL = "https://api.monday.com/v2";
 const MONDAY_FILE_URL = "https://api.monday.com/v2/file";
