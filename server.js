@@ -11,7 +11,7 @@
 
 const express   = require("express");
 const cors      = require("cors");
-const fetch     = require("node-fetch");
+const fetch     = require("node-fetch").default || require("node-fetch");
 const FormData  = require("form-data");
 const Anthropic = require("@anthropic-ai/sdk").default;
 const crypto    = require("crypto");
@@ -87,7 +87,7 @@ function normalizeTicket(item) {
     category:    cols["status_1"]      || "",
     product:     cols["dropdown2"]     || "",
     requestor:   cols["person"]        || "",
-    template:    cols["dropdown4"]     || "",   // Template column (to be added)
+    template:    "",   // Template column — add dropdown4 once column is created on board
     hasFiles:    !!cols["files"],
   };
 }
@@ -103,7 +103,7 @@ async function fetchItemById(itemId) {
         column_values(ids: [
           "status","long_text7","text86","formula",
           "date4","date_mkx4g1zc","dropdown3",
-          "status_1","dropdown2","person","files","dropdown4"
+          "status_1","dropdown2","person","files"
         ]) { id text value }
       }
     }
@@ -199,7 +199,7 @@ app.get("/api/tickets", async (req, res) => {
                 column_values(ids: [
                   "status","long_text7","text86","formula",
                   "date4","date_mkx4g1zc","dropdown3",
-                  "status_1","dropdown2","person","files","dropdown4"
+                  "status_1","dropdown2","person","files"
                 ]) { id text value }
               }
             }
