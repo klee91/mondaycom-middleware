@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Email Template Generator</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f5f5f5; color: #1a1a1a; }
+
+    header { background: #fff; border-bottom: 1px solid #e0e0e0; padding: 16px 32px; display: flex; align-items: center; justify-content: space-between; }
+    header h1 { font-size: 18px; font-weight: 600; }
+    .status { font-size: 12px; color: #00c875; font-weight: 500; }
+
+    .container { max-width: 900px; margin: 32px auto; padding: 0 24px; }
+
+    .tabs { display: flex; gap: 8px; margin-bottom: 24px; }
+    .tab { padding: 8px 18px; border: 1px solid #ddd; border-radius: 8px; background: #fff; cursor: pointer; font-size: 13px; font-weight: 500; color: #555; transition: all .15s; }
+    .tab.active { background: #0073ea; color: #fff; border-color: #0073ea; }
+    .tab:hover:not(.active) { border-color: #0073ea; color: #0073ea; }
+
+    .panel { display: none; }
+    .panel.active { display: block; }
+
+    .card { background: #fff; border: 1px solid #e0e0e0; border-radius: 12px; padding: 24px; margin-bottom: 16px; }
+
+    .ticket { background: #fff; border: 1px solid #e0e0e0; border-radius: 10px; padding: 16px; margin-bottom: 12px; }
+    .ticket-name { font-weight: 600; font-size: 15px; margin-bottom: 8px; }
+    .ticket-meta { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+    .badge { display: inline-block; padding: 2px 10px; border-radius: 4px; font-size: 11px; font-weight: 600; color: #fff; }
+    .ticket-desc { font-size: 13px; color: #666; margin-bottom: 12px; line-height: 1.5; max-height: 40px; overflow: hidden; }
+    .ticket-actions { display: flex; gap: 8px; align-items: center; }
+
+    label { display: block; font-size: 12px; font-weight: 500; color: #666; margin-bottom: 4px; margin-top: 12px; }
+    input, select, textarea { width: 100%; padding: 8px 12px; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; font-family: inherit; background: #fff; }
+    input:focus, select:focus, textarea:focus { outline: none; border-color: #0073ea; }
+    textarea { resize: vertical; }
+    .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+
+    button { padding: 8px 18px; border: 1px solid #ddd; border-radius: 8px; font-size: 13px; font-weight: 500; cursor: pointer; background: #fff; color: #333; transition: all .15s; }
+    button:hover { border-color: #0073ea; color: #0073ea; }
+    button.primary { background: #0073ea; color: #fff; border-color: #0073ea; }
+    button.primary:hover { background: #0060c0; }
+    button.success { background: #00c875; color: #fff; border-color: #00c875; }
+    button.success:hover { background: #00a85e; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .alert { padding: 12px 16px; border-radius: 8px; font-size: 13px; margin-bottom: 12px; }
+    .alert.error { background: #ffeaea; color: #c0392b; border: 1px solid #f5b7b1; }
+    .alert.success { background: #eafaf1; color: #1e8449; border: 1px solid #a9dfbf; }
+    .alert.info { background: #eaf4ff; color: #1a5276; border: 1px solid #aed6f1; }
+
+    .preview-bar { background: #f5f5f5; border-bottom: 1px solid #e0e0e0; padding: 8px 16px; font-size: 12px; color: #666; border-radius: 12px 12px 0 0; }
+    iframe { width: 100%; height: 520px; border: none; background: #fff; border-radius: 0 0 12px 12px; }
+    .preview-wrap { border: 1px solid #e0e0e0; border-radius: 12px; overflow: hidden; margin-top: 12px; }
+
+    .output-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+
+    .empty { text-align: center; padding: 3rem 0; color: #999; font-size: 14px; }
+
+    .refresh-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; font-size: 13px; color: #666; }
+
+    details summary { cursor: pointer; font-size: 13px; color: #666; margin-top: 12px; }
+    pre { margin-top: 8px; padding: 12px; background: #f5f5f5; border-radius: 8px; font-size: 11px; overflow: auto; max-height: 300px; white-space: pre-wrap; word-break: break-all; border: 1px solid #e0e0e0; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>📧 Email Template Generator</h1>
+  <span class="status">● Connected · Email Schedule Board</span>
+</header>
+
+<div class="container">
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('queue')">🗂 New Requests</button>
+    <button class="tab" onclick="switchTab('manual')">✏️ Manual Entry</button>
+    <button class="tab" onclick="switchTab('output')">📄 Output</button>
+  </div>
+
+  <!-- NEW REQUESTS -->
+  <div id="panel-queue" class="panel active">
+    <div class="refresh-bar">
+      <span id="ticket-count">Loading tickets…</span>
+      <button onclick="loadTickets()">↻ Refresh</button>
+    </div>
+    <div id="ticket-error"></div>
+    <div id="ticket-list"></div>
+  </div>
+
+  <!-- MANUAL ENTRY -->
+  <div id="panel-manual" class="panel">
+    <div class="card">
+      <div class="form-grid">
+        <div>
+          <label>Item name *</label>
+          <input id="m-name" placeholder="e.g. June Newsletter" />
+        </div>
+        <div>
+          <label>Template *</label>
+          <select id="m-template">
+            <option>AICPA Town Hall Newsletter</option>
+            <option>DOTCPA General</option>
+            <option>CPACOM General</option>
+          </select>
+        </div>
+        <div>
+          <label>Subject line *</label>
+          <input id="m-subject" placeholder="Email subject line" />
+        </div>
+        <div>
+          <label>Job number</label>
+          <input id="m-job" placeholder="e.g. 26JUN12345678" />
+        </div>
+        <div>
+          <label>Send date</label>
+          <input id="m-date" type="date" />
+        </div>
+        <div>
+          <label>Category</label>
+          <input id="m-category" placeholder="e.g. Newsletter" />
+        </div>
+      </div>
+      <div>
+        <label>Description / body content *</label>
+        <textarea id="m-desc" rows="5" placeholder="Paste ticket description here — Claude will use this to populate the email."></textarea>
+      </div>
+      <div style="margin-top:16px">
+        <button class="primary" onclick="manualGenerate()">Generate email HTML →</button>
+      </div>
+      <div id="manual-error" style="margin-top:12px"></div>
+    </div>
+  </div>
+
+  <!-- OUTPUT -->
+  <div id="panel-output" class="panel">
+    <div id="output-empty" class="empty">No output yet — generate from a ticket or manual entry first.</div>
+    <div id="output-content" style="display:none">
+      <div id="output-meta" class="ticket-meta" style="margin-bottom:12px"></div>
+      <div class="output-actions">
+        <button onclick="downloadHTML()">⬇ Download .html</button>
+        <button onclick="copyHTML()">📋 Copy HTML</button>
+        <button id="upload-btn" class="success" onclick="uploadToMonday()">⬆ Upload to Monday ticket</button>
+      </div>
+      <div id="upload-status"></div>
+      <div class="preview-wrap">
+        <div class="preview-bar" id="preview-label">Preview</div>
+        <iframe id="preview-frame" sandbox="allow-same-origin"></iframe>
+      </div>
+      <details>
+        <summary>View raw HTML</summary>
+        <pre id="raw-html"></pre>
+      </details>
+    </div>
+  </div>
+</div>
+
+<script>
+  const STATUS_COLORS = {
+    "Not started":"#c4c4c4","In Development":"#0096f5","Ready":"#00c875",
+    "Template Complete":"#9cd326","Proofing":"#ff9900","Approved":"#00c875",
+    "Scheduled":"#fdab3d","Sent":"#9cd326","Stuck":"#e2445c","Overdue":"#e2445c",
+    "Running":"#0096f5","Canceled":"#797e93","Holiday":"#9cd326",
+    "Awaiting Feedback":"#ffcb00","Reschedule":"#ff9900"
+  };
+
+  let currentResult = null;
+
+  function switchTab(tab) {
+    document.querySelectorAll(".tab").forEach((t, i) => t.classList.toggle("active", ["queue","manual","output"][i] === tab));
+    document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"));
+    document.getElementById(`panel-${tab}`).classList.add("active");
+  }
+
+  function badge(label, color) {
+    return `<span class="badge" style="background:${color || "#c4c4c4"}">${label}</span>`;
+  }
+
+  async function loadTickets() {
+    document.getElementById("ticket-count").textContent = "Loading…";
+    document.getElementById("ticket-error").innerHTML = "";
+    document.getElementById("ticket-list").innerHTML = "";
+    try {
+      const res  = await fetch("/api/tickets");
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      const tickets = data.tickets || [];
+      document.getElementById("ticket-count").textContent = `${tickets.length} ticket${tickets.length !== 1 ? "s" : ""} found`;
+      if (!tickets.length) {
+        document.getElementById("ticket-list").innerHTML = `<div class="empty">No tickets found in New Requests group.</div>`;
+        return;
+      }
+      document.getElementById("ticket-list").innerHTML = tickets.map(t => `
+        <div class="ticket">
+          <div class="ticket-name">${t.name}</div>
+          <div class="ticket-meta">
+            ${t.status ? badge(t.status, STATUS_COLORS[t.status]) : ""}
+            ${t.category ? badge(t.category, "#0096f5") : ""}
+            ${t.sendDate ? badge("Send: " + t.sendDate, "#797e93") : ""}
+            ${t.jobNumber ? badge(t.jobNumber, "#333") : ""}
+          </div>
+          ${t.description ? `<div class="ticket-desc">${t.description}</div>` : ""}
+          <div class="ticket-actions">
+            <select id="tpl-${t.id}">
+              <option>AICPA Town Hall Newsletter</option>
+              <option>DOTCPA General</option>
+              <option selected>CPACOM General</option>
+            </select>
+            <button class="primary" onclick="generateFromTicket(${JSON.stringify(t).replace(/"/g, '&quot;')})">Generate →</button>
+          </div>
+        </div>
+      `).join("");
+    } catch (e) {
+      document.getElementById("ticket-error").innerHTML = `<div class="alert error">Failed to load tickets: ${e.message}</div>`;
+      document.getElementById("ticket-count").textContent = "Error";
+    }
+  }
+
+  async function generateFromTicket(ticket) {
+    const templateName = document.getElementById(`tpl-${ticket.id}`).value;
+    await runGenerate(ticket, templateName);
+  }
+
+  async function manualGenerate() {
+    const name = document.getElementById("m-name").value.trim();
+    const subjectLine = document.getElementById("m-subject").value.trim();
+    const description = document.getElementById("m-desc").value.trim();
+    if (!name || !subjectLine || !description) {
+      document.getElementById("manual-error").innerHTML = `<div class="alert error">Please fill in Name, Subject line, and Description.</div>`;
+      return;
+    }
+    document.getElementById("manual-error").innerHTML = "";
+    const ticket = {
+      id: "manual", name,
+      subjectLine, description,
+      jobNumber: document.getElementById("m-job").value,
+      sendDate:  document.getElementById("m-date").value,
+      category:  document.getElementById("m-category").value,
+      product: "", type: "", status: "", requestor: "", hasFiles: false
+    };
+    await runGenerate(ticket, document.getElementById("m-template").value);
+  }
+
+  async function runGenerate(ticket, templateName) {
+    switchTab("output");
+    document.getElementById("output-empty").textContent = "Generating email…";
+    document.getElementById("output-empty").style.display = "block";
+    document.getElementById("output-content").style.display = "none";
+    document.getElementById("upload-status").innerHTML = "";
+
+    try {
+      const res  = await fetch("/api/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ticket, templateName })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+
+      currentResult = { html: data.html, ticket, templateName };
+      showOutput();
+    } catch (e) {
+      document.getElementById("output-empty").textContent = `Generation failed: ${e.message}`;
+    }
+  }
+
+  function showOutput() {
+    if (!currentResult) return;
+    const { html, ticket, templateName } = currentResult;
+    document.getElementById("output-empty").style.display = "none";
+    document.getElementById("output-content").style.display = "block";
+    document.getElementById("preview-label").textContent = `Preview · ${ticket.subjectLine || ticket.name}`;
+    document.getElementById("preview-frame").srcdoc = html;
+    document.getElementById("raw-html").textContent = html;
+    document.getElementById("output-meta").innerHTML =
+      `<span class="badge" style="background:#9cd326">Template Complete</span>
+       <span style="font-size:13px;color:#666">${ticket.name}</span>
+       <span style="font-size:13px;color:#999">· ${templateName}</span>`;
+    const uploadBtn = document.getElementById("upload-btn");
+    uploadBtn.style.display = ticket.id === "manual" ? "none" : "inline-block";
+  }
+
+  function downloadHTML() {
+    if (!currentResult) return;
+    const { html, ticket } = currentResult;
+    const blob = new Blob([html], { type: "text/html" });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.href     = url;
+    a.download = `${ticket.name.replace(/\s+/g,"_")}_${ticket.jobNumber || "draft"}.html`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function copyHTML() {
+    if (!currentResult) return;
+    navigator.clipboard.writeText(currentResult.html);
+    const btn = event.target;
+    btn.textContent = "✅ Copied!";
+    setTimeout(() => btn.textContent = "📋 Copy HTML", 2000);
+  }
+
+  async function uploadToMonday() {
+    if (!currentResult) return;
+    const { html, ticket } = currentResult;
+    const btn = document.getElementById("upload-btn");
+    btn.disabled = true;
+    btn.textContent = "Uploading…";
+    document.getElementById("upload-status").innerHTML = "";
+
+    const fileName = `${ticket.name.replace(/\s+/g,"_")}_${ticket.jobNumber || ticket.id}.html`;
+    try {
+      const res  = await fetch("/api/upload", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ itemId: ticket.id, fileName, html })
+      });
+      const data = await res.json();
+      if (data.success) {
+        document.getElementById("upload-status").innerHTML = `<div class="alert success">✓ Uploaded <strong>${fileName}</strong> to the ticket's Files column!</div>`;
+      } else {
+        throw new Error(data.error || "Upload failed");
+      }
+    } catch (e) {
+      document.getElementById("upload-status").innerHTML = `<div class="alert error">✗ Upload failed: ${e.message}</div>`;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "⬆ Upload to Monday ticket";
+    }
+  }
+
+  // Load tickets on page load
+  loadTickets();
+</script>
+</body>
+</html>
