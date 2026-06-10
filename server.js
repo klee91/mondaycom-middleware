@@ -170,6 +170,9 @@ ${templateHtml}`,
   let html = message.content.find(b => b.type === "text")?.text ?? "";
   if (!html) throw new Error("Claude returned no content.");
 
+  // Strip any markdown code fences the model may have added
+  html = html.replace(/^```html\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
+
   // Policy enforcement: reattach footer if Claude removed it
   if (originalFooter && !hasFooter(html)) {
     console.warn(`Footer missing in generated HTML for "${ticket.name}" — reattaching.`);
