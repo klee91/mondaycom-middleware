@@ -72,7 +72,6 @@ async function getSharePointToken() {
   console.log("SharePoint token refreshed.");
   return sharepointToken;
 }
-
 // ─────────────────────────────────────────────
 // Helper: fetch template HTML from SharePoint
 // ─────────────────────────────────────────────
@@ -350,9 +349,43 @@ async function uploadToMonday(itemId, fileName, html) {
 // ROUTES
 // ═════════════════════════════════════════════
 
-// Root + health
-app.get("/",       (_, res) => res.json({ status: "ok", service: "Monday Email Generator" }));
-app.get("/health", (_, res) => res.json({ status: "ok" }));
+// ─────────────────────────────────────────────
+// Debug: test SharePoint auth + file access
+// ─────────────────────────────────────────────
+app.get("/debug/sharepoint", async (req, res) => {
+  try {
+    // Step 1: get token
+    const token = await getSharePointToken();
+    const tokenPreview = token.substring(0, 40) + "...";
+
+    // Step 2: try to list the drive root to verify Files.Read.All works
+    const driveRes  = await fetch(
+      `https://graph.microsoft.com/v1.0/drives/${process.env.SHAREPOINT_DRIVE_ID}/root/children`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    const driveData = await driveRes.json();
+
+    // Step 3: try fetching the first template file directly
+    const firstItemId = Object.values(TEMPLATE_MAP)[0];
+    const fileRes     = await fetch(
+      `https://graph.microsoft.com/v1.0/drives/${process.env.SHAREPOINT_DRIVE_ID}/items/${firstItemId}/content`,
+      { headers: { Authorization: `Bearer ${token}` }, redirect: "manual" }
+    );
+
+    res.json({
+      tokenObtained:    true,
+      tokenPreview,
+      driveListStatus:  driveRes.status,
+      driveListOk:      driveRes.ok,
+      driveItems:       driveData?.value?.map(i => i.name) ?? driveData,
+      templateFetchStatus: fileRes.status,
+      templateFetchOk:     fileRes.ok,
+      templateRedirectUrl: fileRes.headers.get("location") || null,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // GET /api/tickets — fetch all groups, filter for New Requests
 app.get("/api/tickets", async (req, res) => {
