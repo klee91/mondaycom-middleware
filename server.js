@@ -45,6 +45,10 @@ const TEMPLATE_MAP = {
 let sharepointToken = null;
 let tokenExpiresAt  = 0;
 
+// In-memory cache: { itemId: { html, fetchedAt } }
+const templateCache = {};
+const CACHE_TTL_MS  = 10 * 60 * 1000; // 10 minutes
+
 async function getSharePointToken() {
   if (sharepointToken && Date.now() < tokenExpiresAt - 60000) {
     return sharepointToken;
