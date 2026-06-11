@@ -39,8 +39,35 @@ const TEMPLATE_MAP = {
   "CPACOM General":             "0135ZG5S36KVRZLIB3SFEL3RGEYDHPMOP3",
 };
 
-// In-memory cache: { itemId: { html, fetchedAt } }
-const templateCache = {};
+// ─────────────────────────────────────────────
+// SharePoint: client credentials token fetch
+// ─────────────────────────────────────────────
+let sharepointToken = null;
+let tokenExpiresAt  = 0;
+
+async function getSharePointToken() {
+  if (sharepointToken && Date.now() < tokenExpiresAt - 60000) {
+    return sharepointToken;
+  }
+
+  const url  = `https://login.microsoftonline.com/${process.env.SHAREPOINT_TENANT_ID}/oauth2/v2.0/token`;
+  const body = new URLSearchParams({
+    grant_type:    "client_credentials",
+    client_id:     process.env.SHAREPOINT_CLIENT_ID,
+    client_secret: process.env.SHAREPOINT_CLIENT_SECRET,
+    scope:         "https://graph.microsoft.com/.default",
+  });
+
+  const res  = await fetch(url, { method: "POST", body });
+  const data = await res.json();
+
+  if (!data.access_token) throw new Error(`SharePoint auth failed: ${data.error_description || data.error}`);
+
+  sharepointToken = data.access_token;
+  tokenExpiresAt  = Date.now() + data.expires_in * 1000;
+  console.log("SharePoint token refreshed.");
+  return sharepointToken;
+}
 const CACHE_TTL_MS  = 10 * 60 * 1000; // 10 minutes
 
 // ─────────────────────────────────────────────
