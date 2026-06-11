@@ -92,7 +92,7 @@ async function fetchTemplateFromSharePoint(templateName) {
 
   if (!res.ok) throw new Error(`SharePoint fetch failed: ${res.status} ${res.statusText}`);
 
-  const html = await res.text();
+  const html = await fileRes.text();
   templateCache[itemId] = { html, fetchedAt: Date.now() };
   console.log(`Fetched template "${templateName}" from SharePoint (${html.length} bytes)`);
   return html;
