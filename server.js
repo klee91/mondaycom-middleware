@@ -88,7 +88,7 @@ function normalizeTicket(item) {
     category:    cols["status_1"]      || "",
     product:     cols["dropdown2"]     || "",
     requestor:   cols["person"]        || "",
-    template:    "",   // Template column — add dropdown4 once column is created on board
+    instructions: cols["long_text_mm47njms"] || "",  // Instructions column
     hasFiles:    !!cols["files"],
   };
 }
@@ -104,7 +104,7 @@ async function fetchItemById(itemId) {
         column_values(ids: [
           "status","long_text7","text86","formula",
           "date4","date_mkx4g1zc","dropdown3",
-          "status_1","dropdown2","person","files"
+          "status_1","dropdown2","person","files","long_text_mm47njms"
         ]) { id text value }
       }
     }
@@ -115,8 +115,63 @@ async function fetchItemById(itemId) {
 }
 
 // ─────────────────────────────────────────────
-// Helper: extract footer block from HTML
+// Helper: parse Instructions column into a variable map
+// Format supported:
+//   PreheaderText: "some value"
+//   PreheaderText: some value (no quotes)
+//   PreheaderText:
+//   "some value"   (value on next line)
 // ─────────────────────────────────────────────
+function parseInstructions(instructions) {
+  const vars = {};
+  if (!instructions) return vars;
+
+  const VARIABLE_NAMES = [
+    "PreheaderText","BodyText","PrimaryLink","PrimaryText",
+    "SecondaryLink","SecondText","TertiaryLink","TertiaryText"
+  ];
+
+  // Build a regex that matches "VariableName: value" or "VariableName:\n value"
+  const pattern = new RegExp(
+    `(${VARIABLE_NAMES.join("|")})\\s*:\\s*"?([^"\\n]*(?:\\n(?!(?:${VARIABLE_NAMES.join("|")})\\s*:)[^\\n]*)*)"?`,
+    "gi"
+  );
+
+  let match;
+  while ((match = pattern.exec(instructions)) !== null) {
+    const key = match[1].trim();
+    const val = match[2].trim().replace(/^"|"$/g, "");
+    if (key && val) vars[key] = val;
+  }
+
+  return vars;
+}
+
+// ─────────────────────────────────────────────
+// Helper: replace {{Variable}} tokens in HTML
+// Only replaces tokens that are NOT Pardot tags
+// (Pardot tags are {{Recipient.*}}, {{{...}}}, etc.)
+// ─────────────────────────────────────────────
+const CONTENT_VARIABLES = [
+  "PreheaderText","BodyText","PrimaryLink","PrimaryText",
+  "SecondaryLink","SecondText","TertiaryLink","TertiaryText",
+  "Subject","JobNumber"
+];
+
+function applyVariables(html, vars) {
+  let out = html;
+  for (const key of CONTENT_VARIABLES) {
+    if (vars[key] !== undefined) {
+      const regex = new RegExp(`\\{\\{${key}\\}\\}`, "g");
+      out = out.replace(regex, vars[key]);
+    }
+  }
+  // Also replace legacy plain-text placeholders
+  if (vars["BodyText"])   out = out.replace(/BODY_CONTENT_HERE/g, vars["BodyText"]);
+  if (vars["JobNumber"])  out = out.replace(/JOB_NUMBER_HERE/g, vars["JobNumber"])
+                                   .replace(/JOB_NUMBER(?!_)/g, vars["JobNumber"]);
+  return out;
+}
 function extractFooter(html) {
   const match = html.match(/<!--\s*START FOOTER\s*-->([\s\S]*?)<!--\s*END FOOTER\s*-->/i);
   return match ? match[0] : null;
@@ -143,39 +198,55 @@ async function generateHTML(ticket, templateName) {
   const templateHtml = TEMPLATES[templateName];
   if (!templateHtml) throw new Error(`Unknown template: ${templateName}`);
 
-  // Extract footer before sending to Claude — we'll verify it's retained after
   const originalFooter = extractFooter(templateHtml);
 
-  const message = await anthropic.messages.create({
-    model:      "claude-haiku-4-5-20251001",
-    max_tokens: 8000,
-    system:     AI_SYSTEM_PROMPT,
-    messages: [{
-      role:    "user",
-      content: `Ticket data:
+  // Step 1: Parse Instructions column into variable map
+  const vars = parseInstructions(ticket.instructions);
+
+  // Step 2: Inject Subject and JobNumber from their own columns
+  vars["Subject"]    = ticket.subjectLine || ticket.name || "";
+  vars["JobNumber"]  = ticket.jobNumber || "";
+
+  // Step 3: Apply all known variables directly — no AI needed for these
+  let html = applyVariables(templateHtml, vars);
+
+  // Step 4: Check which content placeholders still need filling
+  const stillMissing = [];
+  if (/BODY_CONTENT_HERE/.test(html) || /\{\{BodyText\}\}/.test(html)) stillMissing.push("BodyText");
+  if (/\{\{PreheaderText\}\}/.test(html)) stillMissing.push("PreheaderText");
+  if (/BUTTON_TEXT/.test(html))           stillMissing.push("ButtonText");
+
+  // Step 5: Only call Claude if there are unfilled placeholders
+  if (stillMissing.length > 0) {
+    const message = await anthropic.messages.create({
+      model:      "claude-haiku-4-5-20251001",
+      max_tokens: 8000,
+      system:     AI_SYSTEM_PROMPT,
+      messages: [{
+        role:    "user",
+        content: `The following placeholders still need content: ${stillMissing.join(", ")}
+
+Ticket data:
 Name: ${ticket.name}
 Template: ${templateName}
-Subject Line: ${ticket.subjectLine || ticket.name}
-Job Number: ${ticket.jobNumber || ""}
-Send Date: ${ticket.sendDate || ""}
+Subject Line: ${vars["Subject"]}
+Job Number: ${vars["JobNumber"]}
 Description: ${ticket.description || "No description provided."}
 Category: ${ticket.category || ""}
 Product: ${ticket.product || ""}
 
-BASE HTML TEMPLATE:
-${templateHtml}`,
-    }],
-  });
+HTML TEMPLATE (partially populated — only fill the remaining placeholders listed above):
+${html}`,
+      }],
+    });
 
-  let html = message.content.find(b => b.type === "text")?.text ?? "";
-  if (!html) throw new Error("Claude returned no content.");
+    html = message.content.find(b => b.type === "text")?.text ?? html;
+    html = html.replace(/^```html\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
+  }
 
-  // Strip any markdown code fences the model may have added
-  html = html.replace(/^```html\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
-
-  // Policy enforcement: reattach footer if Claude removed it
+  // Step 6: Footer enforcement
   if (originalFooter && !hasFooter(html)) {
-    console.warn(`Footer missing in generated HTML for "${ticket.name}" — reattaching.`);
+    console.warn(`Footer missing for "${ticket.name}" — reattaching.`);
     html = reattachFooter(html, originalFooter);
   }
 
@@ -235,7 +306,7 @@ app.get("/api/tickets", async (req, res) => {
                 column_values(ids: [
                   "status","long_text7","text86","formula",
                   "date4","date_mkx4g1zc","dropdown3",
-                  "status_1","dropdown2","person","files"
+                  "status_1","dropdown2","person","files","long_text_mm47njms"
                 ]) { id text value }
               }
             }
