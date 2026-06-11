@@ -354,36 +354,44 @@ async function uploadToMonday(itemId, fileName, html) {
 // ─────────────────────────────────────────────
 app.get("/debug/sharepoint", async (req, res) => {
   try {
-    // Step 1: get token
     const token = await getSharePointToken();
-    const tokenPreview = token.substring(0, 40) + "...";
+    const firstItemId = Object.values(TEMPLATE_MAP)[0];
 
-    // Step 2: try to list the drive root to verify Files.Read.All works
-    const driveRes  = await fetch(
-      `https://graph.microsoft.com/v1.0/drives/${process.env.SHAREPOINT_DRIVE_ID}/root/children`,
+    // Test the exact metadata fetch the generate flow uses
+    const metaRes = await fetch(
+      `https://graph.microsoft.com/v1.0/drives/${process.env.SHAREPOINT_DRIVE_ID}/items/${firstItemId}?select=id,name,@microsoft.graph.downloadUrl`,
       { headers: { Authorization: `Bearer ${token}` } }
     );
-    const driveData = await driveRes.json();
+    const metaData = await metaRes.json();
 
-    // Step 3: try fetching the first template file directly
-    const firstItemId = Object.values(TEMPLATE_MAP)[0];
-    const fileRes     = await fetch(
-      `https://graph.microsoft.com/v1.0/drives/${process.env.SHAREPOINT_DRIVE_ID}/items/${firstItemId}/content`,
-      { headers: { Authorization: `Bearer ${token}` }, redirect: "manual" }
-    );
+    let downloadStatus = null;
+    let downloadOk = null;
+    let contentPreview = null;
+    const downloadUrl = metaData["@microsoft.graph.downloadUrl"];
+    if (downloadUrl) {
+      const fileRes = await fetch(downloadUrl);
+      downloadStatus = fileRes.status;
+      downloadOk = fileRes.ok;
+      if (fileRes.ok) {
+        const text = await fileRes.text();
+        contentPreview = text.substring(0, 200);
+      }
+    }
 
     res.json({
-      tokenObtained:    true,
-      tokenPreview,
-      driveListStatus:  driveRes.status,
-      driveListOk:      driveRes.ok,
-      driveItems:       driveData?.value?.map(i => i.name) ?? driveData,
-      templateFetchStatus: fileRes.status,
-      templateFetchOk:     fileRes.ok,
-      templateRedirectUrl: fileRes.headers.get("location") || null,
+      tokenObtained: true,
+      driveId: process.env.SHAREPOINT_DRIVE_ID ? "set" : "MISSING",
+      firstItemId,
+      metadataStatus: metaRes.status,
+      metadataOk: metaRes.ok,
+      metadataResponse: metaRes.ok ? { id: metaData.id, name: metaData.name } : metaData,
+      hasDownloadUrl: !!downloadUrl,
+      downloadStatus,
+      downloadOk,
+      contentPreview,
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: err.message, stack: err.stack });
   }
 });
 
