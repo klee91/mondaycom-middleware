@@ -72,7 +72,6 @@ async function getSharePointToken() {
   console.log("SharePoint token refreshed.");
   return sharepointToken;
 }
-const CACHE_TTL_MS  = 10 * 60 * 1000; // 10 minutes
 
 // ─────────────────────────────────────────────
 // Helper: fetch template HTML from SharePoint
