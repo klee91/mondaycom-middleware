@@ -42,25 +42,39 @@ const TEMPLATE_MAP = {
 };
 
 const CONTENT_VARIABLES = [
-  "PreheaderText","BodyText","PrimaryLink","PrimaryText",
-  "SecondaryLink","SecondText","TertiaryLink","TertiaryText",
-  "Subject","JobNumber"
+  "PreheaderText","BodyText","Subject","JobNumber"
 ];
 
-const AI_SYSTEM_PROMPT = `You are an email template generator. Populate the HTML template with ticket data.
-RULES:
+const AI_SYSTEM_PROMPT = `You are an email template generator for CPA.com. Populate the HTML template with ticket data, strictly following the CPA.com brand standards below.
+
+OUTPUT RULES:
 - Your response must start with < and end with >. Nothing before the opening < and nothing after the closing >.
-- Do NOT wrap output in markdown code fences. Do NOT include \`\`\`html or \`\`\` anywhere in your response.
+- Do NOT wrap output in markdown code fences. Do NOT include \`\`\`html or \`\`\` anywhere.
 - Keep ALL HTML structure, styles, images, and links completely intact.
-- CRITICAL: Any existing {{...}} or {{{...}}} tokens in the template are Pardot merge tags. Leave them exactly as-is. Never modify, replace, or remove them.
-- CRITICAL: The HTML section between <!-- START FOOTER --> and <!-- END FOOTER --> must ALWAYS be present and completely intact in your output. Never remove, truncate, or modify it.
-- Only replace these plain text placeholders:
-    BODY_CONTENT_HERE → email body copy written from the ticket description
-    BUTTON_TEXT       → a relevant CTA based on ticket context
-    JOB_NUMBER_HERE   → the job number, or remove the line if blank
-    JOB_NUMBER        → the job number, or remove the line if blank
-- Write body copy in a professional tone appropriate to the template and product.
-- If the description says TBD or TBC, write appropriate placeholder copy based on the subject line and product.`;
+
+PROTECTED — NEVER MODIFY:
+- Any existing {{...}} or {{{...}}} tokens are Pardot merge tags. Leave them exactly as-is.
+- The section between <!-- START FOOTER --> and <!-- END FOOTER --> must remain completely intact.
+- Pre-built buttons already in the template (such as multi-cell "Read more" bracket buttons with side images) must keep their structure. Only change their href or link text if explicitly instructed.
+
+CPA.COM BRAND STANDARDS (STRICT — match exactly, no deviation):
+- Font: always 'Roboto', Arial, Helvetica, sans-serif.
+- Body copy: font-size 16px, font-weight 300, line-height 22-23px, color #000000.
+- Body paragraphs: each <p> uses style margin: 0 0 10px 0 (or 0 0 20px 0 between major sections).
+- Bold/strong text: font-weight 700.
+- Greeting is always: Hi {{Recipient.FirstName}},
+- Inline text links: color #86387f, text-decoration underline.
+- Section/accent headers: font-weight 700, color #0f206c (navy).
+- Bulleted lists: font-family Roboto, font-size 16px, font-weight 300, line-height 23px, padding-left 20-30px. List items use margin 0 0 10px 0.
+- Do NOT introduce new colors, fonts, font sizes, or spacing values outside these standards.
+- Do NOT add inline styles that conflict with the above.
+
+CONTENT PLACEHOLDERS (only replace these):
+- BODY_CONTENT_HERE → email body copy written from the ticket description, following the brand standards above.
+- BUTTON_TEXT → relevant CTA based on ticket context.
+- JOB_NUMBER_HERE / JOB_NUMBER → the job number, or remove the line if blank.
+
+TONE: professional, clear, appropriate for accounting and finance professionals. If the description says TBD or TBC, write appropriate placeholder copy based on the subject line and product.`;
 
 // ═════════════════════════════════════════════
 // SharePoint: client credentials token + template fetch
@@ -185,16 +199,37 @@ async function fetchItemById(itemId) {
 }
 
 // ═════════════════════════════════════════════
+// Brand-standard button HTML (Outlook-safe, table-based)
+// ═════════════════════════════════════════════
+function buildButton(text, url) {
+  return `<table border="0" cellpadding="0" cellspacing="0" width="100%" role="presentation"><tbody><tr><td align="center" style="padding:20px 0;"><table border="0" cellpadding="0" cellspacing="0" style="border-collapse:separate!important;" width="300"><tbody><tr><td align="center" style="background-color:#72246C;border-radius:3px;font-family:Arial,Helvetica,sans-serif;font-size:15px;padding:12px 20px;"><a href="${url}" target="_blank" style="color:#FFFFFF;text-decoration:none;display:inline-block;font-weight:bold;">${text}</a></td></tr></tbody></table></td></tr></tbody></table>`;
+}
+
+// Convert marketer-friendly button syntax into brand button HTML
+// Recognizes:
+//   Button: Register Now
+//   Link: https://cpa.com/register
+// (the two lines can be in either order, and are matched as a pair)
+function parseButtons(html) {
+  // Match "Button: <text>" followed within a few lines by "Link: <url>"
+  const pattern = /Button:\s*(.+?)\s*[\r\n]+\s*Link:\s*(\S+)/gi;
+  let out = html.replace(pattern, (_, text, url) => buildButton(text.trim(), url.trim()));
+
+  // Also handle reverse order: "Link:" first, then "Button:"
+  const reversePattern = /Link:\s*(\S+)\s*[\r\n]+\s*Button:\s*(.+?)(?=[\r\n]|$)/gi;
+  out = out.replace(reversePattern, (_, url, text) => buildButton(text.trim(), url.trim()));
+
+  return out;
+}
+
+// ═════════════════════════════════════════════
 // Instructions parsing + variable substitution
 // ═════════════════════════════════════════════
 function parseInstructions(instructions) {
   const vars = {};
   if (!instructions) return vars;
 
-  const VARIABLE_NAMES = [
-    "PreheaderText","BodyText","PrimaryLink","PrimaryText",
-    "SecondaryLink","SecondText","TertiaryLink","TertiaryText"
-  ];
+  const VARIABLE_NAMES = ["PreheaderText","BodyText"];
 
   const pattern = new RegExp(
     `(${VARIABLE_NAMES.join("|")})\\s*:\\s*"?([^"\\n]*(?:\\n(?!(?:${VARIABLE_NAMES.join("|")})\\s*:)[^\\n]*)*)"?`,
@@ -219,6 +254,9 @@ function applyVariables(html, vars) {
   }
   if (vars["BodyText"])  out = out.replace(/BODY_CONTENT_HERE/g, vars["BodyText"]);
   if (vars["JobNumber"]) out = out.replace(/JOB_NUMBER_HERE/g, vars["JobNumber"]).replace(/JOB_NUMBER(?!_)/g, vars["JobNumber"]);
+
+  // Convert any [[BUTTON: text | url]] tokens into brand button HTML
+  out = parseButtons(out);
   return out;
 }
 
