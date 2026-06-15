@@ -220,11 +220,14 @@ async function readAgentState(itemId) {
 
 async function writeAgentState(itemId, state) {
   const json = JSON.stringify(state);
+  // Long-text columns expect a value of the form {"text":"..."}.
+  // The GraphQL $val variable must itself be a JSON-encoded string of that object.
+  const value = JSON.stringify({ text: json });
   await mondayQuery(`
     mutation SetState($itemId: ID!, $boardId: ID!, $val: JSON!) {
       change_column_value(item_id: $itemId, board_id: $boardId, column_id: "${AGENT_STATE_COLUMN}", value: $val) { id }
     }
-  `, { itemId, boardId: BOARD_ID, val: JSON.stringify(json) });
+  `, { itemId, boardId: BOARD_ID, val: value });
 }
 
 // Post an update (comment) on an item, optionally tagging a user by ID
