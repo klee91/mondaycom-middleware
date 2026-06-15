@@ -261,6 +261,134 @@ function applyVariables(html, vars) {
 }
 
 // ═════════════════════════════════════════════
+// Header image: fetch from ticket Files, re-host on SharePoint
+// ═════════════════════════════════════════════
+
+// The folder item ID in SharePoint where header images get re-hosted.
+// Set HEADER_UPLOAD_FOLDER_ID in env (a folder in the same drive).
+async function fetchTicketFiles(itemId) {
+  const data = await mondayQuery(`
+    query GetFiles($itemId: ID!) {
+      items(ids: [$itemId]) {
+        assets { id name url public_url file_extension }
+      }
+    }
+  `, { itemId });
+  return data?.items?.[0]?.assets ?? [];
+}
+
+// Pick the first image asset that is NOT a generated .html proof
+function pickHeaderImage(assets) {
+  const IMAGE_EXT = ["png", "jpg", "jpeg", "gif"];
+  return assets.find(a => {
+    const ext = (a.file_extension || a.name.split(".").pop() || "").toLowerCase();
+    return IMAGE_EXT.includes(ext);
+  });
+}
+
+// Download bytes from a Monday asset (public_url works without auth; url needs token)
+async function downloadMondayAsset(asset) {
+  const src = asset.public_url || asset.url;
+  const res = await fetch(src);
+  if (!res.ok) throw new Error(`Asset download failed: ${res.status}`);
+  return Buffer.from(await res.arrayBuffer());
+}
+
+// Resolve the upload folder's item ID. Accepts either a raw item ID
+// (HEADER_UPLOAD_FOLDER_ID) or a SharePoint share URL (HEADER_UPLOAD_FOLDER_URL).
+let cachedFolderId = null;
+async function getHeaderFolderId() {
+  if (cachedFolderId) return cachedFolderId;
+  if (process.env.HEADER_UPLOAD_FOLDER_ID) {
+    cachedFolderId = process.env.HEADER_UPLOAD_FOLDER_ID;
+    return cachedFolderId;
+  }
+
+  const shareUrl = process.env.HEADER_UPLOAD_FOLDER_URL;
+  if (!shareUrl) throw new Error("No HEADER_UPLOAD_FOLDER_ID or HEADER_UPLOAD_FOLDER_URL set.");
+
+  // Encode share URL per Microsoft Graph sharing URL spec
+  const b64 = Buffer.from(shareUrl).toString("base64")
+    .replace(/=+$/, "").replace(/\//g, "_").replace(/\+/g, "-");
+  const shareId = "u!" + b64;
+
+  const token = await getSharePointToken();
+  const res   = await fetch(
+    `https://graph.microsoft.com/v1.0/shares/${shareId}/driveItem`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  if (!res.ok) throw new Error(`Folder resolve failed: ${res.status}`);
+  const item = await res.json();
+  cachedFolderId = item.id;
+  console.log(`Resolved header upload folder ID: ${cachedFolderId}`);
+  return cachedFolderId;
+}
+
+// Upload bytes to SharePoint and create an anonymous (public) share link
+async function rehostToSharePoint(fileName, buffer) {
+  const token  = await getSharePointToken();
+  const folder = await getHeaderFolderId();
+
+  // Upload (simple PUT for files under 4MB)
+  const uploadUrl = `https://graph.microsoft.com/v1.0/drives/${process.env.SHAREPOINT_DRIVE_ID}/items/${folder}:/${encodeURIComponent(fileName)}:/content`;
+  const upRes = await fetch(uploadUrl, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/octet-stream" },
+    body: buffer,
+  });
+  if (!upRes.ok) throw new Error(`SharePoint upload failed: ${upRes.status}`);
+  const uploaded = await upRes.json();
+
+  // Create an anonymous view link
+  const linkRes = await fetch(
+    `https://graph.microsoft.com/v1.0/drives/${process.env.SHAREPOINT_DRIVE_ID}/items/${uploaded.id}/createLink`,
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ type: "view", scope: "anonymous" }),
+    }
+  );
+  if (!linkRes.ok) throw new Error(`Share link creation failed: ${linkRes.status}`);
+  const linkData = await linkRes.json();
+
+  // Convert the share URL to a direct-download form usable in <img src>
+  let webUrl = linkData?.link?.webUrl || "";
+  if (webUrl && !webUrl.includes("download=1")) {
+    webUrl += (webUrl.includes("?") ? "&" : "?") + "download=1";
+  }
+  return webUrl;
+}
+
+// Replace the first <img src="..."> in the HTML with a new URL
+function replaceFirstImage(html, newUrl) {
+  let replaced = false;
+  return html.replace(/(<img\b[^>]*\bsrc=")([^"]*)(")/i, (m, pre, _src, post) => {
+    if (replaced) return m;
+    replaced = true;
+    return pre + newUrl + post;
+  });
+}
+
+// Full header-swap flow; returns possibly-modified HTML
+async function applyHeaderImage(html, itemId) {
+  try {
+    const assets = await fetchTicketFiles(itemId);
+    const header = pickHeaderImage(assets);
+    if (!header) return html; // no image attached — keep default
+
+    const buf       = await downloadMondayAsset(header);
+    const publicUrl = await rehostToSharePoint(`header_${itemId}_${header.name}`, buf);
+    if (!publicUrl) return html;
+
+    console.log(`Header image re-hosted: ${publicUrl}`);
+    return replaceFirstImage(html, publicUrl);
+  } catch (err) {
+    console.warn(`Header image swap skipped for item ${itemId}: ${err.message}`);
+    return html; // fail safe — keep default header
+  }
+}
+
+// ═════════════════════════════════════════════
 // Footer protection
 // ═════════════════════════════════════════════
 function extractFooter(html) {
@@ -326,6 +454,11 @@ ${html}`,
   if (originalFooter && !hasFooter(html)) {
     console.warn(`Footer missing for "${ticket.name}" — reattaching.`);
     html = reattachFooter(html, originalFooter);
+  }
+
+  // Swap header image if one is attached to the ticket's Files column
+  if (ticket.id && ticket.id !== "manual") {
+    html = await applyHeaderImage(html, ticket.id);
   }
 
   return html;
