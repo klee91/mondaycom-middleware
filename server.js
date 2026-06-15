@@ -176,6 +176,7 @@ function normalizeTicket(item) {
     product:      cols["dropdown2"]          || "",
     requestor:    cols["person"]             || "",
     instructions: cols["long_text_mm47njms"] || "",
+    agentState:   cols["long_text_agentstate"] || "",
     hasFiles:     !!cols["files"],
   };
 }
@@ -188,7 +189,7 @@ async function fetchItemById(itemId) {
         column_values(ids: [
           "status","long_text7","text86","formula",
           "date4","date_mkx4g1zc","dropdown3",
-          "status_1","dropdown2","person","files","long_text_mm47njms"
+          "status_1","dropdown2","person","files","long_text_mm47njms","long_text_agentstate"
         ]) { id text value }
       }
     }
@@ -196,6 +197,52 @@ async function fetchItemById(itemId) {
   const item = data?.items?.[0];
   if (!item) throw new Error(`Item ${itemId} not found.`);
   return normalizeTicket(item);
+}
+
+// ─────────────────────────────────────────────
+// Agent state: stored as JSON in the Agent State long-text column
+// ─────────────────────────────────────────────
+const AGENT_STATE_COLUMN = "long_text_agentstate"; // update to real column ID
+
+async function readAgentState(itemId) {
+  const data = await mondayQuery(`
+    query GetState($itemId: ID!) {
+      items(ids: [$itemId]) {
+        column_values(ids: ["${AGENT_STATE_COLUMN}"]) { text value }
+      }
+    }
+  `, { itemId });
+  const raw = data?.items?.[0]?.column_values?.[0]?.text || "";
+  if (!raw) return { revision: 0, history: [], currentHtml: "" };
+  try { return JSON.parse(raw); }
+  catch { return { revision: 0, history: [], currentHtml: "" }; }
+}
+
+async function writeAgentState(itemId, state) {
+  const json = JSON.stringify(state);
+  await mondayQuery(`
+    mutation SetState($itemId: ID!, $boardId: ID!, $val: JSON!) {
+      change_column_value(item_id: $itemId, board_id: $boardId, column_id: "${AGENT_STATE_COLUMN}", value: $val) { id }
+    }
+  `, { itemId, boardId: BOARD_ID, val: JSON.stringify(json) });
+}
+
+// Post an update (comment) on an item, optionally tagging a user by ID
+async function postUpdate(itemId, body) {
+  await mondayQuery(`
+    mutation PostUpdate($itemId: ID!, $body: String!) {
+      create_update(item_id: $itemId, body: $body) { id }
+    }
+  `, { itemId, body });
+}
+
+// Look up a user's ID by name (for @-mention); returns null if not found
+async function findUserIdByName(name) {
+  if (!name) return null;
+  const data = await mondayQuery(`query { users { id name } }`);
+  const users = data?.users ?? [];
+  const match = users.find(u => u.name.toLowerCase() === name.toLowerCase());
+  return match ? match.id : null;
 }
 
 // ═════════════════════════════════════════════
@@ -465,6 +512,45 @@ ${html}`,
 }
 
 // ═════════════════════════════════════════════
+// Agent: revise an existing draft based on requestor feedback
+// ═════════════════════════════════════════════
+async function reviseHTML(currentHtml, feedback, history) {
+  const originalFooter = extractFooter(currentHtml);
+
+  const historyText = history.length
+    ? history.map((h, i) => `Round ${i + 1}: ${h}`).join("\n")
+    : "(none)";
+
+  const message = await anthropic.messages.create({
+    model:      "claude-haiku-4-5-20251001",
+    max_tokens: 8000,
+    system:     AI_SYSTEM_PROMPT,
+    messages: [{
+      role: "user",
+      content: `You previously generated this email proof. The requestor has reviewed it and given feedback. Apply ONLY the requested changes while keeping everything else intact and following all CPA.com brand standards.
+
+PRIOR FEEDBACK ROUNDS:
+${historyText}
+
+NEW FEEDBACK TO APPLY:
+${feedback}
+
+CURRENT EMAIL HTML:
+${currentHtml}`,
+    }],
+  });
+
+  let html = message.content.find(b => b.type === "text")?.text ?? currentHtml;
+  html = html.replace(/^```html\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
+
+  if (originalFooter && !hasFooter(html)) {
+    html = reattachFooter(html, originalFooter);
+  }
+  return html;
+}
+
+
+// ═════════════════════════════════════════════
 // Upload to Monday
 // ═════════════════════════════════════════════
 async function uploadToMonday(itemId, fileName, html) {
@@ -595,25 +681,108 @@ app.post("/api/upload", async (req, res) => {
   }
 });
 
-// POST /api/webhook — Monday fires on item creation
+// POST /api/webhook — Monday agent: handles item creation, feedback, approval
 app.post("/api/webhook", async (req, res) => {
   const { challenge, event } = req.body;
-  if (challenge) return res.json({ challenge });
-  if (event?.type !== "create_pulse") return res.json({ status: "ignored" });
 
-  const itemId = String(event.pulseId);
-  console.log(`Webhook: new item created — ID ${itemId}`);
+  // Monday setup handshake
+  if (challenge) return res.json({ challenge });
+  if (!event) return res.json({ status: "ignored" });
+
+  // Respond immediately so Monday doesn't retry; process async
   res.json({ status: "received" });
 
   try {
-    const ticket       = await fetchItemById(itemId);
-    const templateName = "CPACOM General"; // default; switch to Template column once added
-    const html         = await generateHTML(ticket, templateName);
-    const fileName     = `${ticket.name.replace(/\s+/g, "_")}_${ticket.jobNumber || itemId}.html`;
-    const asset        = await uploadToMonday(itemId, fileName, html);
-    console.log(`✅ Uploaded ${fileName} to item ${itemId} — asset ID: ${asset?.id}`);
+    // ── Trigger 1: new item created → generate first proof ──
+    if (event.type === "create_pulse") {
+      const itemId = String(event.pulseId);
+      console.log(`[agent] New item ${itemId} — generating first proof`);
+
+      const ticket       = await fetchItemById(itemId);
+      const templateName = "CPACOM General"; // default until Template column wired
+      const html         = await generateHTML(ticket, templateName);
+      const fileName     = `${ticket.name.replace(/\s+/g, "_")}_${ticket.jobNumber || itemId}_v1.html`;
+
+      await uploadToMonday(itemId, fileName, html);
+      await writeAgentState(itemId, { revision: 1, history: [], currentHtml: html });
+
+      // Tag the requestor in an update
+      const requestorId = await findUserIdByName(ticket.requestor);
+      const mention = requestorId ? `<p>[@${ticket.requestor}](${requestorId})</p>` : "";
+      await postUpdate(itemId,
+        `${mention}Your email proof (v1) is ready and attached to this item's Files. ` +
+        `Review it and reply with <strong>@agent</strong> followed by any changes you'd like. ` +
+        `When it's ready, set Status to <strong>Approved</strong>.`
+      );
+      return;
+    }
+
+    // ── Trigger 2: update posted → feedback if it starts with @agent ──
+    if (event.type === "create_update") {
+      const itemId = String(event.pulseId);
+      const body   = (event.body || event.textBody || "").trim();
+
+      // Strip HTML tags for keyword detection
+      const plain = body.replace(/<[^>]+>/g, "").trim();
+      if (!/^@agent\b/i.test(plain)) {
+        console.log(`[agent] Update on ${itemId} ignored (no @agent prefix)`);
+        return;
+      }
+
+      const feedback = plain.replace(/^@agent\b[:,\s]*/i, "").trim();
+      if (!feedback) return;
+
+      console.log(`[agent] Feedback on ${itemId}: "${feedback}"`);
+
+      const ticket = await fetchItemById(itemId);
+
+      // Don't act on approved items
+      if ((ticket.status || "").toLowerCase() === "approved") {
+        console.log(`[agent] Item ${itemId} already approved — ignoring feedback`);
+        return;
+      }
+
+      const state   = await readAgentState(itemId);
+      const baseHtml = state.currentHtml;
+      if (!baseHtml) {
+        await postUpdate(itemId, `<p>I don't have a prior draft stored for this item, so I can't revise. Please re-trigger generation.</p>`);
+        return;
+      }
+
+      const revised = await reviseHTML(baseHtml, feedback, state.history || []);
+      const newRev  = (state.revision || 1) + 1;
+      const fileName = `${ticket.name.replace(/\s+/g, "_")}_${ticket.jobNumber || itemId}_v${newRev}.html`;
+
+      await uploadToMonday(itemId, fileName, revised);
+      await writeAgentState(itemId, {
+        revision:   newRev,
+        history:    [...(state.history || []), feedback],
+        currentHtml: revised,
+      });
+
+      const requestorId = await findUserIdByName(ticket.requestor);
+      const mention = requestorId ? `[@${ticket.requestor}](${requestorId}) ` : "";
+      await postUpdate(itemId,
+        `<p>${mention}Updated proof (v${newRev}) is attached with your requested changes. ` +
+        `Reply with <strong>@agent</strong> for more edits, or set Status to <strong>Approved</strong> when ready.</p>`
+      );
+      return;
+    }
+
+    // ── Trigger 3: status changed → if Approved, agent goes silent ──
+    if (event.type === "update_column_value" && event.columnId === "status") {
+      const itemId = String(event.pulseId);
+      const label  = event.value?.label?.text || event.value?.label || "";
+      if ((label || "").toLowerCase() === "approved") {
+        console.log(`[agent] Item ${itemId} approved — finalizing, no further action`);
+        // Silent per spec — nothing to post or change
+      }
+      return;
+    }
+
+    console.log(`[agent] Unhandled event type: ${event.type}`);
   } catch (err) {
-    console.error(`Webhook processing error for item ${itemId}:`, err.message);
+    console.error(`[agent] Webhook processing error:`, err.message);
   }
 });
 
