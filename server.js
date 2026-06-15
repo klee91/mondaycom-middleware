@@ -176,7 +176,7 @@ function normalizeTicket(item) {
     product:      cols["dropdown2"]          || "",
     requestor:    cols["person"]             || "",
     instructions: cols["long_text_mm47njms"] || "",
-    agentState:   cols["long_text_agentstate"] || "",
+    agentState:   cols["long_text_mm4b1t9h"] || "",
     hasFiles:     !!cols["files"],
   };
 }
@@ -189,7 +189,7 @@ async function fetchItemById(itemId) {
         column_values(ids: [
           "status","long_text7","text86","formula",
           "date4","date_mkx4g1zc","dropdown3",
-          "status_1","dropdown2","person","files","long_text_mm47njms","long_text_agentstate"
+          "status_1","dropdown2","person","files","long_text_mm47njms","long_text_mm4b1t9h"
         ]) { id text value }
       }
     }
@@ -202,7 +202,7 @@ async function fetchItemById(itemId) {
 // ─────────────────────────────────────────────
 // Agent state: stored as JSON in the Agent State long-text column
 // ─────────────────────────────────────────────
-const AGENT_STATE_COLUMN = "long_text_agentstate"; // update to real column ID
+const AGENT_STATE_COLUMN = "long_text_mm4b1t9h"; // Agent State column
 
 async function readAgentState(itemId) {
   const data = await mondayQuery(`
