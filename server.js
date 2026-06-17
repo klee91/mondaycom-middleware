@@ -36,6 +36,7 @@ const anthropic       = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
 const AGENT_STATE_COLUMN = "long_text_mm4b1t9h"; // Agent State column
 const INSTRUCTIONS_COLUMN = "long_text_mm47njms"; // Instructions column
+const TEMPLATE_COLUMN = "dropdown_mm4d2e9v"; // Template dropdown column
 
 const TEMPLATE_MAP = {
   "AICPA Town Hall Newsletter": "0135ZG5SYRC5GCY6GDPFDJVT3R37W5MFI7",
@@ -166,6 +167,7 @@ function normalizeTicket(item) {
     requestor:    cols["person"]             || "",
     instructions: cols[INSTRUCTIONS_COLUMN]  || "",
     agentState:   cols[AGENT_STATE_COLUMN]   || "",
+    template:     cols[TEMPLATE_COLUMN]       || "",
     hasFiles:     !!cols["files"],
   };
 }
@@ -178,7 +180,7 @@ async function fetchItemById(itemId) {
         column_values(ids: [
           "status","long_text7","text86","formula",
           "date4","date_mkx4g1zc","dropdown3",
-          "status_1","dropdown2","person","files","${INSTRUCTIONS_COLUMN}","${AGENT_STATE_COLUMN}"
+          "status_1","dropdown2","person","files","${INSTRUCTIONS_COLUMN}","${AGENT_STATE_COLUMN}","${TEMPLATE_COLUMN}"
         ]) { id text value }
       }
     }
@@ -351,8 +353,15 @@ function applyVariables(html, vars) {
   for (const key of CONTENT_VARIABLES) {
     if (vars[key] !== undefined) out = out.replace(new RegExp(`\\{\\{${key}\\}\\}`, "g"), vars[key]);
   }
-  if (vars["BodyText"])  out = out.replace(/BODY_CONTENT_HERE/g, vars["BodyText"]);
-  if (vars["JobNumber"]) out = out.replace(/JOB_NUMBER_HERE/g, vars["JobNumber"]).replace(/JOB_NUMBER(?!_)/g, vars["JobNumber"]);
+  if (vars["BodyText"]) out = out.replace(/BODY_CONTENT_HERE/g, vars["BodyText"]);
+
+  // Job Number: support {{JobNumber}}, JOB_NUMBER_HERE, and plain JOB_NUMBER tokens
+  if (vars["JobNumber"]) {
+    out = out
+      .replace(/\{\{JobNumber\}\}/g, vars["JobNumber"])
+      .replace(/JOB_NUMBER_HERE/g, vars["JobNumber"])
+      .replace(/\bJOB_NUMBER\b/g, vars["JobNumber"]);
+  }
 
   out = parseButtons(out);
   return out;
@@ -372,6 +381,18 @@ function reattachFooter(html, footer) {
   const insertPoint = html.lastIndexOf("</tbody></table></div>");
   if (insertPoint !== -1) return html.slice(0, insertPoint) + "\n" + footer + "\n" + html.slice(insertPoint);
   return html.replace("</body>", footer + "\n</body>");
+}
+
+// Resolve which template to use from the ticket's Template dropdown value.
+// Falls back to "CPACOM General" if empty or unrecognized.
+function resolveTemplateName(ticket) {
+  const raw = (ticket.template || "").trim();
+  if (raw && TEMPLATE_MAP[raw]) return raw;
+  // Case-insensitive match as a convenience
+  const ci = Object.keys(TEMPLATE_MAP).find(k => k.toLowerCase() === raw.toLowerCase());
+  if (ci) return ci;
+  if (raw) console.log(`[template] "${raw}" not in library — defaulting to CPACOM General`);
+  return "CPACOM General";
 }
 
 // ═════════════════════════════════════════════
@@ -604,7 +625,7 @@ app.get("/api/tickets", async (req, res) => {
                 column_values(ids: [
                   "status","long_text7","text86","formula",
                   "date4","date_mkx4g1zc","dropdown3",
-                  "status_1","dropdown2","person","files","${INSTRUCTIONS_COLUMN}","${AGENT_STATE_COLUMN}"
+                  "status_1","dropdown2","person","files","${INSTRUCTIONS_COLUMN}","${AGENT_STATE_COLUMN}","${TEMPLATE_COLUMN}"
                 ]) { id text value }
               }
             }
@@ -665,7 +686,7 @@ app.post("/api/webhook", async (req, res) => {
       console.log(`[agent] New item ${itemId} — generating first proof`);
 
       const ticket       = await fetchItemById(itemId);
-      const templateName = "CPACOM General";
+      const templateName = resolveTemplateName(ticket);
       const html         = await generateHTML(ticket, templateName);
       const fileName     = `${ticket.name.replace(/\s+/g, "_")}_${ticket.jobNumber || itemId}_v1.html`;
 
