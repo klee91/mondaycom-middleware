@@ -200,6 +200,75 @@ async function fetchItemById(itemId) {
 }
 
 // ─────────────────────────────────────────────
+// Agent state:
+//   - Heavy data (currentHtml) → agent_state JSON file in Files column
+//   - Lightweight metadata (revision, history) → Agent State long-text column
+// ─────────────────────────────────────────────
+const AGENT_STATE_COLUMN = "long_text_mm4b1t9h"; // Agent State column
+
+async function readAgentMeta(itemId) {
+  const data = await mondayQuery(`
+    query GetState($itemId: ID!) {
+      items(ids: [$itemId]) {
+        column_values(ids: ["${AGENT_STATE_COLUMN}"]) { text }
+      }
+    }
+  `, { itemId });
+  const raw = data?.items?.[0]?.column_values?.[0]?.text || "";
+  if (!raw) return { revision: 0, history: [], stateFile: null };
+  try { return JSON.parse(raw); }
+  catch { return { revision: 0, history: [], stateFile: null }; }
+}
+
+async function readCurrentHtml(itemId, meta) {
+  if (!meta?.stateFile) return "";
+  try {
+    const assets = await fetchTicketFiles(itemId);
+    const match  = assets.find(a => a.name === meta.stateFile);
+    if (!match) return "";
+    const buf  = await downloadMondayAsset(match);
+    const blob = JSON.parse(buf.toString("utf-8"));
+    return blob.currentHtml || "";
+  } catch (err) {
+    console.warn(`Could not recover HTML for ${itemId}: ${err.message}`);
+    return "";
+  }
+}
+
+async function persistAgentState(itemId, revision, history, currentHtml) {
+  const stateFileName = `agent_state_${itemId}.json`;
+  const blob = JSON.stringify({ revision, currentHtml });
+
+  // 1. Upload the heavy state file to Files
+  await uploadToMonday(itemId, stateFileName, blob, "application/json");
+
+  // 2. Write lightweight metadata to the column
+  const meta  = JSON.stringify({ revision, history, stateFile: stateFileName });
+  const value = JSON.stringify({ text: meta });
+  await mondayQuery(`
+    mutation SetState($itemId: ID!, $boardId: ID!, $val: JSON!) {
+      change_column_value(item_id: $itemId, board_id: $boardId, column_id: "${AGENT_STATE_COLUMN}", value: $val) { id }
+    }
+  `, { itemId, boardId: BOARD_ID, val: value });
+}
+
+async function postUpdate(itemId, body) {
+  await mondayQuery(`
+    mutation PostUpdate($itemId: ID!, $body: String!) {
+      create_update(item_id: $itemId, body: $body) { id }
+    }
+  `, { itemId, body });
+}
+
+async function findUserIdByName(name) {
+  if (!name) return null;
+  const data = await mondayQuery(`query { users { id name } }`);
+  const users = data?.users ?? [];
+  const match = users.find(u => u.name.toLowerCase() === name.toLowerCase());
+  return match ? match.id : null;
+}
+
+// ─────────────────────────────────────────────
 // Agent state: stored as JSON in the Agent State long-text column
 // ─────────────────────────────────────────────
 const AGENT_STATE_COLUMN = "long_text_mm4b1t9h"; // Agent State column
@@ -554,7 +623,7 @@ ${currentHtml}`,
 
 
 // ═════════════════════════════════════════════
-// Upload to Monday
+// Upload to Monday (content can be HTML or JSON)
 // ═════════════════════════════════════════════
 async function uploadToMonday(itemId, fileName, content, contentType = "text/html") {
   const query = `
