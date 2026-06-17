@@ -556,7 +556,7 @@ ${currentHtml}`,
 // ═════════════════════════════════════════════
 // Upload to Monday
 // ═════════════════════════════════════════════
-async function uploadToMonday(itemId, fileName, html) {
+async function uploadToMonday(itemId, fileName, content, contentType = "text/html") {
   const query = `
     mutation AddFileToColumn($itemId: ID!, $columnId: String!, $file: File!) {
       add_file_to_column(item_id: $itemId, column_id: $columnId, file: $file) { id name url }
@@ -566,8 +566,8 @@ async function uploadToMonday(itemId, fileName, html) {
   form.append("query", query);
   form.append("variables", JSON.stringify({ itemId, columnId: "files", file: null }));
   form.append("map", JSON.stringify({ "0": ["variables.file"] }));
-  const buf = Buffer.from(html, "utf-8");
-  form.append("0", buf, { filename: fileName, contentType: "text/html", knownLength: buf.length });
+  const buf = Buffer.from(content, "utf-8");
+  form.append("0", buf, { filename: fileName, contentType, knownLength: buf.length });
 
   const res = await fetch(MONDAY_FILE_URL, {
     method:  "POST",
@@ -706,17 +706,19 @@ app.post("/api/webhook", async (req, res) => {
       const html         = await generateHTML(ticket, templateName);
       const fileName     = `${ticket.name.replace(/\s+/g, "_")}_${ticket.jobNumber || itemId}_v1.html`;
 
+      // Upload the proof, THEN persist state — and only post "ready" after both succeed.
       await uploadToMonday(itemId, fileName, html);
-      await writeAgentState(itemId, { revision: 1, history: [], currentHtml: html });
+      await persistAgentState(itemId, 1, [], html);
 
-      // Tag the requestor in an update
+      // State is guaranteed in place before the requestor is notified — no race.
       const requestorId = await findUserIdByName(ticket.requestor);
-      const mention = requestorId ? `<p>[@${ticket.requestor}](${requestorId})</p>` : "";
+      const mention = requestorId ? `[@${ticket.requestor}](${requestorId}) ` : "";
       await postUpdate(itemId,
-        `${mention}Your email proof (v1) is ready and attached to this item's Files. ` +
+        `<p>${mention}Your email proof (v1) is ready and attached to this item's Files. ` +
         `Review it and reply with <strong>@agent</strong> followed by any changes you'd like. ` +
-        `When it's ready, set Status to <strong>Approved</strong>.`
+        `When it's ready, set Status to <strong>Approved</strong>.</p>`
       );
+      console.log(`[agent] Item ${itemId} v1 complete`);
       return;
     }
 
@@ -745,23 +747,20 @@ app.post("/api/webhook", async (req, res) => {
         return;
       }
 
-      const state   = await readAgentState(itemId);
-      const baseHtml = state.currentHtml;
+      const meta     = await readAgentMeta(itemId);
+      const baseHtml = await readCurrentHtml(itemId, meta);
       if (!baseHtml) {
-        await postUpdate(itemId, `<p>I don't have a prior draft stored for this item, so I can't revise. Please re-trigger generation.</p>`);
+        await postUpdate(itemId, `<p>I don't have a prior draft stored for this item yet. If the first proof was just generated, give it a moment and try again.</p>`);
         return;
       }
 
-      const revised = await reviseHTML(baseHtml, feedback, state.history || []);
-      const newRev  = (state.revision || 1) + 1;
+      const revised  = await reviseHTML(baseHtml, feedback, meta.history || []);
+      const newRev   = (meta.revision || 1) + 1;
       const fileName = `${ticket.name.replace(/\s+/g, "_")}_${ticket.jobNumber || itemId}_v${newRev}.html`;
 
+      // Upload proof + persist state BEFORE notifying — no race.
       await uploadToMonday(itemId, fileName, revised);
-      await writeAgentState(itemId, {
-        revision:   newRev,
-        history:    [...(state.history || []), feedback],
-        currentHtml: revised,
-      });
+      await persistAgentState(itemId, newRev, [...(meta.history || []), feedback], revised);
 
       const requestorId = await findUserIdByName(ticket.requestor);
       const mention = requestorId ? `[@${ticket.requestor}](${requestorId}) ` : "";
@@ -769,6 +768,7 @@ app.post("/api/webhook", async (req, res) => {
         `<p>${mention}Updated proof (v${newRev}) is attached with your requested changes. ` +
         `Reply with <strong>@agent</strong> for more edits, or set Status to <strong>Approved</strong> when ready.</p>`
       );
+      console.log(`[agent] Item ${itemId} revised to v${newRev}`);
       return;
     }
 
