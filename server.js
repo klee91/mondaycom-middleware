@@ -685,7 +685,14 @@ app.post("/api/webhook", async (req, res) => {
       const itemId = String(event.pulseId);
       console.log(`[agent] New item ${itemId} — generating first proof`);
 
-      const ticket       = await fetchItemById(itemId);
+      const ticket = await fetchItemById(itemId);
+
+      // Guardrail: only generate when the Instructions column has content
+      if (!ticket.instructions || !ticket.instructions.trim()) {
+        console.log(`[agent] Item ${itemId} has no Instructions — skipping generation`);
+        return;
+      }
+
       const templateName = resolveTemplateName(ticket);
       const html         = await generateHTML(ticket, templateName);
       const fileName     = `${ticket.name.replace(/\s+/g, "_")}_${ticket.jobNumber || itemId}_v1.html`;
