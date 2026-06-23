@@ -322,26 +322,77 @@ function parseButtons(html) {
 // ═════════════════════════════════════════════
 // Instructions parsing + variable substitution
 // ═════════════════════════════════════════════
+
+// Single-value named fields. BodyText/IntroText intentionally capture across
+// lines (including any inline Button:/Link: pairs) up to the next single field
+// or an Article block, so inline buttons stay embedded in the copy.
+const SINGLE_FIELDS = ["PreheaderText", "PreheaderLink", "IntroText", "BodyText"];
+
 function parseInstructions(instructions) {
   const vars = {};
   if (!instructions) return vars;
-  const VARIABLE_NAMES = ["PreheaderText", "PreheaderLink", "BodyText"];
+  const boundary = [...SINGLE_FIELDS, "Article"].join("|");
   const pattern = new RegExp(
-    `(${VARIABLE_NAMES.join("|")})\\s*:\\s*"?([^"\\n]*(?:\\n(?!(?:${VARIABLE_NAMES.join("|")})\\s*:)[^\\n]*)*)"?`,
+    `(${SINGLE_FIELDS.join("|")})\\s*:\\s*"?([\\s\\S]*?)"?\\s*(?=(?:\\n|^)\\s*(?:${boundary})\\s*:|$)`,
     "gi"
   );
   let match;
   while ((match = pattern.exec(instructions)) !== null) {
     const key = match[1].trim();
     const val = match[2].trim().replace(/^"|"$/g, "");
-    if (key && val) vars[key] = val;
+    if (key && val && vars[key] === undefined) vars[key] = val;
   }
   return vars;
 }
 
-function applyVariables(html, vars) {
+// Parse repeatable Article blocks. Each "Article:" starts a new module.
+function parseArticles(instructions) {
+  if (!instructions) return [];
+  const blocks = instructions.split(/(?:\n|^)\s*Article\s*:/i).slice(1);
+  const articles = [];
+  for (const block of blocks) {
+    const title        = (block.match(/Title:\s*(.+)/i) || [])[1] || "";
+    const whatsNew     = (block.match(/WhatsNew:\s*([\s\S]*?)(?=\n\s*(?:WhyItMatters|Link|Title)\s*:|$)/i) || [])[1] || "";
+    const whyItMatters = (block.match(/WhyItMatters:\s*([\s\S]*?)(?=\n\s*(?:Link|Title|WhatsNew)\s*:|$)/i) || [])[1] || "";
+    const link         = (block.match(/Link:\s*(\S+)/i) || [])[1] || "";
+    if (title || whatsNew || whyItMatters || link) {
+      articles.push({
+        title: title.trim(), whatsNew: whatsNew.trim(),
+        whyItMatters: whyItMatters.trim(), link: link.trim(),
+      });
+    }
+  }
+  return articles;
+}
+
+// Expand a repeatable module region marked by <!-- ARTICLE MODULE START/END -->.
+// Clones the region once per article, substituting article tokens.
+function expandArticleModules(html, articles) {
+  const marker = /<!--\s*ARTICLE MODULE START\s*-->([\s\S]*?)<!--\s*ARTICLE MODULE END\s*-->/i;
+  const m = html.match(marker);
+  if (!m) return html;                       // template has no repeatable region
+  const moduleTpl = m[1];
+  if (!articles.length) return html.replace(marker, ""); // no articles → drop region
+
+  const rendered = articles.map((a, i) => moduleTpl
+    .replace(/\{\{ArticleAnchor\}\}/g, `art${i + 1}`)
+    .replace(/\{\{ArticleNumber\}\}/g, String(i + 1))
+    .replace(/\{\{ArticleTitle\}\}/g, a.title || "")
+    .replace(/\{\{ArticleWhatsNew\}\}/g, a.whatsNew || "")
+    .replace(/\{\{ArticleWhyItMatters\}\}/g, a.whyItMatters || "")
+    .replace(/\{\{ArticleLink\}\}/g, a.link || "#")
+  ).join("\n");
+
+  return html.replace(marker, rendered);
+}
+
+function applyVariables(html, vars, articles = []) {
   let out = html;
 
+  // 1. Expand repeatable article modules (complex templates only)
+  out = expandArticleModules(out, articles);
+
+  // 2. Preheader (optional hyperlink wrap)
   if (vars["PreheaderText"] !== undefined) {
     let preheader = vars["PreheaderText"];
     if (vars["PreheaderLink"]) {
@@ -350,12 +401,14 @@ function applyVariables(html, vars) {
     out = out.replace(/\{\{PreheaderText\}\}/g, preheader);
   }
 
-  for (const key of CONTENT_VARIABLES) {
-    if (vars[key] !== undefined) out = out.replace(new RegExp(`\\{\\{${key}\\}\\}`, "g"), vars[key]);
+  // 3. Generic single-field token substitution ({{IntroText}}, {{Subject}}, etc.)
+  for (const key of Object.keys(vars)) {
+    if (key === "PreheaderText" || key === "PreheaderLink") continue;
+    out = out.replace(new RegExp(`\\{\\{${key}\\}\\}`, "g"), vars[key]);
   }
-  if (vars["BodyText"]) out = out.replace(/BODY_CONTENT_HERE/g, vars["BodyText"]);
 
-  // Job Number: support {{JobNumber}}, JOB_NUMBER_HERE, and plain JOB_NUMBER tokens
+  // 4. Legacy plain-text placeholders
+  if (vars["BodyText"]) out = out.replace(/BODY_CONTENT_HERE/g, vars["BodyText"]);
   if (vars["JobNumber"]) {
     out = out
       .replace(/\{\{JobNumber\}\}/g, vars["JobNumber"])
@@ -363,6 +416,7 @@ function applyVariables(html, vars) {
       .replace(/\bJOB_NUMBER\b/g, vars["JobNumber"]);
   }
 
+  // 5. Convert any Button:/Link: blocks into brand button HTML
   out = parseButtons(out);
   return out;
 }
@@ -404,11 +458,12 @@ async function generateHTML(ticket, templateName) {
 
   const originalFooter = extractFooter(templateHtml);
 
-  const vars = parseInstructions(ticket.instructions);
+  const vars     = parseInstructions(ticket.instructions);
+  const articles = parseArticles(ticket.instructions);
   vars["Subject"]   = ticket.subjectLine || ticket.name || "";
   vars["JobNumber"] = ticket.jobNumber || "";
 
-  let html = applyVariables(templateHtml, vars);
+  let html = applyVariables(templateHtml, vars, articles);
 
   const stillMissing = [];
   if (/BODY_CONTENT_HERE/.test(html) || /\{\{BodyText\}\}/.test(html)) stillMissing.push("BodyText");
