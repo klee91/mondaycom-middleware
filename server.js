@@ -38,11 +38,7 @@ const AGENT_STATE_COLUMN = "long_text_mm4b1t9h"; // Agent State column
 const INSTRUCTIONS_COLUMN = "long_text_mm47njms"; // Instructions column
 const TEMPLATE_COLUMN = "dropdown_mm4d2e9v"; // Template dropdown column
 
-const TEMPLATE_MAP = {
-  "AICPA Town Hall Newsletter": "0135ZG5SYRC5GCY6GDPFDJVT3R37W5MFI7",
-  "DOTCPA General":             "0135ZG5S4OE2ZR2WA4BZELNKR6CP5ISLZ3",
-  "CPACOM General":             "0135ZG5S36KVRZLIB3SFEL3RGEYDHPMOP3",
-};
+const SHAREPOINT_TEMPLATES_FOLDER = "Email Templates";
 
 const CONTENT_VARIABLES = ["PreheaderText", "BodyText", "Subject", "JobNumber"];
 
@@ -85,7 +81,8 @@ TONE: professional, clear, appropriate for accounting and finance professionals.
 // ═════════════════════════════════════════════
 let sharepointToken = null;
 let tokenExpiresAt  = 0;
-const templateCache = {};
+const templateHtmlCache = {};  // { itemId: { html, fetchedAt } }
+let   templateIndexCache = null; // { map: { displayName: itemId }, fetchedAt }
 const CACHE_TTL_MS  = 10 * 60 * 1000;
 
 async function getSharePointToken() {
@@ -108,14 +105,49 @@ async function getSharePointToken() {
   return sharepointToken;
 }
 
-async function fetchTemplateFromSharePoint(templateName) {
-  const itemId = TEMPLATE_MAP[templateName];
-  if (!itemId) throw new Error(`Unknown template: "${templateName}"`);
+// Convert a SharePoint filename to a human-friendly display name.
+// e.g. "CPACOM_GENERAL_TEMPLATE.html" → "CPACOM General"
+//      "CPA_PARTNER_(DOUBLE).html"    → "CPA Partner (Double)"
+function fileNameToDisplayName(filename) {
+  return filename
+    .replace(/\.html$/i, "")
+    .replace(/_TEMPLATE$/i, "")
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, c => c.toUpperCase());
+}
 
-  const cached = templateCache[itemId];
+// Fetch (and cache) the folder listing → { displayName: itemId }
+async function fetchTemplateIndex() {
+  if (templateIndexCache && Date.now() - templateIndexCache.fetchedAt < CACHE_TTL_MS) {
+    return templateIndexCache.map;
+  }
+  const token = await getSharePointToken();
+  const url   = `https://graph.microsoft.com/v1.0/drives/${process.env.SHAREPOINT_DRIVE_ID}/root:/${encodeURIComponent(SHAREPOINT_TEMPLATES_FOLDER)}:/children?$select=id,name`;
+  const res   = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error(`Template index fetch failed: ${res.status} ${res.statusText}`);
+  const data = await res.json();
+  const map  = {};
+  for (const item of (data.value || [])) {
+    if (/\.html$/i.test(item.name)) map[fileNameToDisplayName(item.name)] = item.id;
+  }
+  templateIndexCache = { map, fetchedAt: Date.now() };
+  console.log(`Template index refreshed: ${Object.keys(map).join(", ")}`);
+  return map;
+}
+
+async function fetchTemplateFromSharePoint(templateName) {
+  const index = await fetchTemplateIndex();
+
+  // Exact match → case-insensitive match → CPACOM General fallback
+  const itemId = index[templateName]
+    ?? index[Object.keys(index).find(k => k.toLowerCase() === (templateName || "").toLowerCase())]
+    ?? index["CPACOM General"];
+  if (!itemId) throw new Error("No templates found in SharePoint folder.");
+
+  const cached = templateHtmlCache[itemId];
   if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) return cached.html;
 
-  const token = await getSharePointToken();
+  const token   = await getSharePointToken();
   const metaRes = await fetch(
     `https://graph.microsoft.com/v1.0/drives/${process.env.SHAREPOINT_DRIVE_ID}/items/${itemId}?select=id,name,@microsoft.graph.downloadUrl`,
     { headers: { Authorization: `Bearer ${token}` } }
@@ -130,7 +162,7 @@ async function fetchTemplateFromSharePoint(templateName) {
   if (!fileRes.ok) throw new Error(`SharePoint download failed: ${fileRes.status}`);
 
   const html = await fileRes.text();
-  templateCache[itemId] = { html, fetchedAt: Date.now() };
+  templateHtmlCache[itemId] = { html, fetchedAt: Date.now() };
   console.log(`Fetched template "${templateName}" from SharePoint (${html.length} bytes)`);
   return html;
 }
@@ -322,77 +354,26 @@ function parseButtons(html) {
 // ═════════════════════════════════════════════
 // Instructions parsing + variable substitution
 // ═════════════════════════════════════════════
-
-// Single-value named fields. BodyText/IntroText intentionally capture across
-// lines (including any inline Button:/Link: pairs) up to the next single field
-// or an Article block, so inline buttons stay embedded in the copy.
-const SINGLE_FIELDS = ["PreheaderText", "PreheaderLink", "IntroText", "BodyText"];
-
 function parseInstructions(instructions) {
   const vars = {};
   if (!instructions) return vars;
-  const boundary = [...SINGLE_FIELDS, "Article"].join("|");
+  const VARIABLE_NAMES = ["PreheaderText", "PreheaderLink", "BodyText"];
   const pattern = new RegExp(
-    `(${SINGLE_FIELDS.join("|")})\\s*:\\s*"?([\\s\\S]*?)"?\\s*(?=(?:\\n|^)\\s*(?:${boundary})\\s*:|$)`,
+    `(${VARIABLE_NAMES.join("|")})\\s*:\\s*"?([^"\\n]*(?:\\n(?!(?:${VARIABLE_NAMES.join("|")})\\s*:)[^\\n]*)*)"?`,
     "gi"
   );
   let match;
   while ((match = pattern.exec(instructions)) !== null) {
     const key = match[1].trim();
     const val = match[2].trim().replace(/^"|"$/g, "");
-    if (key && val && vars[key] === undefined) vars[key] = val;
+    if (key && val) vars[key] = val;
   }
   return vars;
 }
 
-// Parse repeatable Article blocks. Each "Article:" starts a new module.
-function parseArticles(instructions) {
-  if (!instructions) return [];
-  const blocks = instructions.split(/(?:\n|^)\s*Article\s*:/i).slice(1);
-  const articles = [];
-  for (const block of blocks) {
-    const title        = (block.match(/Title:\s*(.+)/i) || [])[1] || "";
-    const whatsNew     = (block.match(/WhatsNew:\s*([\s\S]*?)(?=\n\s*(?:WhyItMatters|Link|Title)\s*:|$)/i) || [])[1] || "";
-    const whyItMatters = (block.match(/WhyItMatters:\s*([\s\S]*?)(?=\n\s*(?:Link|Title|WhatsNew)\s*:|$)/i) || [])[1] || "";
-    const link         = (block.match(/Link:\s*(\S+)/i) || [])[1] || "";
-    if (title || whatsNew || whyItMatters || link) {
-      articles.push({
-        title: title.trim(), whatsNew: whatsNew.trim(),
-        whyItMatters: whyItMatters.trim(), link: link.trim(),
-      });
-    }
-  }
-  return articles;
-}
-
-// Expand a repeatable module region marked by <!-- ARTICLE MODULE START/END -->.
-// Clones the region once per article, substituting article tokens.
-function expandArticleModules(html, articles) {
-  const marker = /<!--\s*ARTICLE MODULE START\s*-->([\s\S]*?)<!--\s*ARTICLE MODULE END\s*-->/i;
-  const m = html.match(marker);
-  if (!m) return html;                       // template has no repeatable region
-  const moduleTpl = m[1];
-  if (!articles.length) return html.replace(marker, ""); // no articles → drop region
-
-  const rendered = articles.map((a, i) => moduleTpl
-    .replace(/\{\{ArticleAnchor\}\}/g, `art${i + 1}`)
-    .replace(/\{\{ArticleNumber\}\}/g, String(i + 1))
-    .replace(/\{\{ArticleTitle\}\}/g, a.title || "")
-    .replace(/\{\{ArticleWhatsNew\}\}/g, a.whatsNew || "")
-    .replace(/\{\{ArticleWhyItMatters\}\}/g, a.whyItMatters || "")
-    .replace(/\{\{ArticleLink\}\}/g, a.link || "#")
-  ).join("\n");
-
-  return html.replace(marker, rendered);
-}
-
-function applyVariables(html, vars, articles = []) {
+function applyVariables(html, vars) {
   let out = html;
 
-  // 1. Expand repeatable article modules (complex templates only)
-  out = expandArticleModules(out, articles);
-
-  // 2. Preheader (optional hyperlink wrap)
   if (vars["PreheaderText"] !== undefined) {
     let preheader = vars["PreheaderText"];
     if (vars["PreheaderLink"]) {
@@ -401,14 +382,12 @@ function applyVariables(html, vars, articles = []) {
     out = out.replace(/\{\{PreheaderText\}\}/g, preheader);
   }
 
-  // 3. Generic single-field token substitution ({{IntroText}}, {{Subject}}, etc.)
-  for (const key of Object.keys(vars)) {
-    if (key === "PreheaderText" || key === "PreheaderLink") continue;
-    out = out.replace(new RegExp(`\\{\\{${key}\\}\\}`, "g"), vars[key]);
+  for (const key of CONTENT_VARIABLES) {
+    if (vars[key] !== undefined) out = out.replace(new RegExp(`\\{\\{${key}\\}\\}`, "g"), vars[key]);
   }
-
-  // 4. Legacy plain-text placeholders
   if (vars["BodyText"]) out = out.replace(/BODY_CONTENT_HERE/g, vars["BodyText"]);
+
+  // Job Number: support {{JobNumber}}, JOB_NUMBER_HERE, and plain JOB_NUMBER tokens
   if (vars["JobNumber"]) {
     out = out
       .replace(/\{\{JobNumber\}\}/g, vars["JobNumber"])
@@ -416,7 +395,6 @@ function applyVariables(html, vars, articles = []) {
       .replace(/\bJOB_NUMBER\b/g, vars["JobNumber"]);
   }
 
-  // 5. Convert any Button:/Link: blocks into brand button HTML
   out = parseButtons(out);
   return out;
 }
@@ -439,11 +417,11 @@ function reattachFooter(html, footer) {
 
 // Resolve which template to use from the ticket's Template dropdown value.
 // Falls back to "CPACOM General" if empty or unrecognized.
-function resolveTemplateName(ticket) {
-  const raw = (ticket.template || "").trim();
-  if (raw && TEMPLATE_MAP[raw]) return raw;
-  // Case-insensitive match as a convenience
-  const ci = Object.keys(TEMPLATE_MAP).find(k => k.toLowerCase() === raw.toLowerCase());
+async function resolveTemplateName(ticket) {
+  const raw   = (ticket.template || "").trim();
+  const index = await fetchTemplateIndex();
+  if (raw && index[raw]) return raw;
+  const ci = Object.keys(index).find(k => k.toLowerCase() === raw.toLowerCase());
   if (ci) return ci;
   if (raw) console.log(`[template] "${raw}" not in library — defaulting to CPACOM General`);
   return "CPACOM General";
@@ -458,12 +436,11 @@ async function generateHTML(ticket, templateName) {
 
   const originalFooter = extractFooter(templateHtml);
 
-  const vars     = parseInstructions(ticket.instructions);
-  const articles = parseArticles(ticket.instructions);
+  const vars = parseInstructions(ticket.instructions);
   vars["Subject"]   = ticket.subjectLine || ticket.name || "";
   vars["JobNumber"] = ticket.jobNumber || "";
 
-  let html = applyVariables(templateHtml, vars, articles);
+  let html = applyVariables(templateHtml, vars);
 
   const stillMissing = [];
   if (/BODY_CONTENT_HERE/.test(html) || /\{\{BodyText\}\}/.test(html)) stillMissing.push("BodyText");
@@ -641,7 +618,8 @@ app.get("/health", (_, res) => res.json({ status: "ok" }));
 app.get("/debug/sharepoint", async (req, res) => {
   try {
     const token = await getSharePointToken();
-    const firstItemId = Object.values(TEMPLATE_MAP)[0];
+    const index = await fetchTemplateIndex();
+    const firstItemId = Object.values(index)[0];
     const metaRes = await fetch(
       `https://graph.microsoft.com/v1.0/drives/${process.env.SHAREPOINT_DRIVE_ID}/items/${firstItemId}?select=id,name,@microsoft.graph.downloadUrl`,
       { headers: { Authorization: `Bearer ${token}` } }
@@ -748,7 +726,7 @@ app.post("/api/webhook", async (req, res) => {
         return;
       }
 
-      const templateName = resolveTemplateName(ticket);
+      const templateName = await resolveTemplateName(ticket);
       const html         = await generateHTML(ticket, templateName);
       const fileName     = `${ticket.name.replace(/\s+/g, "_")}_${ticket.jobNumber || itemId}_v1.html`;
 
