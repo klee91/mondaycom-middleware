@@ -38,7 +38,6 @@ const AGENT_STATE_COLUMN = "long_text_mm4b1t9h"; // Agent State column
 const INSTRUCTIONS_COLUMN = "long_text_mm47njms"; // Instructions column
 const TEMPLATE_COLUMN = "dropdown_mm4d2e9v"; // Template dropdown column
 
-const SHAREPOINT_TEMPLATES_FOLDER = "Email Templates";
 
 const CONTENT_VARIABLES = ["PreheaderText", "BodyText", "Subject", "JobNumber"];
 
@@ -122,7 +121,7 @@ async function fetchTemplateIndex() {
     return templateIndexCache.map;
   }
   const token = await getSharePointToken();
-  const url   = `https://graph.microsoft.com/v1.0/drives/${process.env.SHAREPOINT_DRIVE_ID}/root:/${encodeURIComponent(SHAREPOINT_TEMPLATES_FOLDER)}:/children?$select=id,name`;
+  const url   = `https://graph.microsoft.com/v1.0/drives/${process.env.SHAREPOINT_DRIVE_ID}/root/children?$select=id,name`;
   const res   = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
   if (!res.ok) throw new Error(`Template index fetch failed: ${res.status} ${res.statusText}`);
   const data = await res.json();
