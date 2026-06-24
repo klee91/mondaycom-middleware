@@ -651,12 +651,13 @@ async function persistAgentState(itemId, revision, history, currentHtml) {
   `, { itemId, boardId: BOARD_ID, val: value });
 }
 
-async function postUpdate(itemId, body) {
+async function postUpdate(itemId, body, mentionIds = []) {
+  const mentionsList = mentionIds.map(id => ({ id: parseInt(id, 10), type: "User" }));
   await mondayQuery(`
-    mutation PostUpdate($itemId: ID!, $body: String!) {
-      create_update(item_id: $itemId, body: $body) { id }
+    mutation PostUpdate($itemId: ID!, $body: String!, $mentionsList: [MentionInput!]) {
+      create_update(item_id: $itemId, body: $body, mentions_list: $mentionsList) { id }
     }
-  `, { itemId, body });
+  `, { itemId, body, mentionsList: mentionsList.length ? mentionsList : undefined });
 }
 
 async function findUserIdByName(name) {
@@ -795,11 +796,13 @@ app.post("/api/webhook", async (req, res) => {
       await persistAgentState(itemId, 1, [], html);
 
       const requestorId = await findUserIdByName(ticket.requestor);
-      const mention = requestorId ? `[@${ticket.requestor.split(",")[0].trim()}](${requestorId}) ` : "";
+      const mentionName = ticket.requestor.split(",")[0].trim();
+      const mentionTag  = requestorId ? `<strong>@${mentionName}</strong> ` : "";
       await postUpdate(itemId,
-        `<p>${mention}Your email proof (v1) is ready and attached to this item's Files. ` +
+        `<p>${mentionTag}Your email proof (v1) is ready and attached to this item's Files. ` +
         `Review it and reply with <strong>@agent</strong> followed by any changes you'd like. ` +
-        `When it's ready, set Status to <strong>Approved</strong>.</p>`
+        `When it's ready, set Status to <strong>Approved</strong>.</p>`,
+        requestorId ? [requestorId] : []
       );
       console.log(`[agent] Item ${itemId} v1 complete`);
       return;
@@ -842,10 +845,12 @@ app.post("/api/webhook", async (req, res) => {
       await persistAgentState(itemId, newRev, [...(meta.history || []), feedback], revised);
 
       const requestorId = await findUserIdByName(ticket.requestor);
-      const mention = requestorId ? `[@${ticket.requestor.split(",")[0].trim()}](${requestorId}) ` : "";
+      const mentionName = ticket.requestor.split(",")[0].trim();
+      const mentionTag  = requestorId ? `<strong>@${mentionName}</strong> ` : "";
       await postUpdate(itemId,
-        `<p>${mention}Updated proof (v${newRev}) is attached with your requested changes. ` +
-        `Reply with <strong>@agent</strong> for more edits, or set Status to <strong>Approved</strong> when ready.</p>`
+        `<p>${mentionTag}Updated proof (v${newRev}) is attached with your requested changes. ` +
+        `Reply with <strong>@agent</strong> for more edits, or set Status to <strong>Approved</strong> when ready.</p>`,
+        requestorId ? [requestorId] : []
       );
       console.log(`[agent] Item ${itemId} revised to v${newRev}`);
       return;
