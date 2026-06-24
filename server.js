@@ -40,7 +40,7 @@ const INSTRUCTIONS_COLUMN = "long_text_mm47njms"; // Instructions column
 const TEMPLATE_COLUMN = "dropdown_mm4d2e9v"; // Template dropdown column
 
 
-const CONTENT_VARIABLES = ["PreheaderText", "BodyText", "Subject", "JobNumber"];
+const CONTENT_VARIABLES = ["PreheaderText", "BodyText", "Subject"];
 
 const BUTTON_COLORS = {
   "purple": "#72246c", "light purple": "#86387f", "green": "#48a23f", "navy": "#0f206c",
@@ -182,14 +182,21 @@ async function mondayQuery(query, variables = {}, apiVersion = "2024-01") {
 
 function normalizeTicket(item) {
   const cols = {};
-  for (const cv of item.column_values) cols[cv.id] = cv.text ?? cv.value ?? "";
+  const formulaVals = {};
+  for (const cv of item.column_values) {
+    cols[cv.id] = cv.text ?? cv.value ?? "";
+    // Formula columns return blank text/value — capture display_value instead
+    if (cv.display_value !== undefined && cv.display_value !== null && cv.display_value !== "") {
+      formulaVals[cv.id] = cv.display_value;
+    }
+  }
   return {
     id:           item.id,
     name:         item.name,
     status:       cols["status"]             || "",
     description:  cols["long_text7"]         || "",
     subjectLine:  cols["text86"]             || "",
-    jobNumber:    cols["formula"]            || "",
+    jobNumber:    formulaVals["formula"]     || cols["formula"] || "",
     sendDate:     cols["date4"]              || "",
     contentDue:   cols["date_mkx4g1zc"]     || "",
     type:         cols["dropdown3"]          || "",
@@ -212,10 +219,13 @@ async function fetchItemById(itemId) {
           "status","long_text7","text86","formula",
           "date4","date_mkx4g1zc","dropdown3",
           "status_1","dropdown2","person","files","${INSTRUCTIONS_COLUMN}","${AGENT_STATE_COLUMN}","${TEMPLATE_COLUMN}"
-        ]) { id text value }
+        ]) {
+          id text value
+          ... on FormulaValue { display_value }
+        }
       }
     }
-  `, { itemId });
+  `, { itemId }, "2025-07");
   const item = data?.items?.[0];
   if (!item) throw new Error(`Item ${itemId} not found.`);
   return normalizeTicket(item);
@@ -738,13 +748,16 @@ app.get("/api/tickets", async (req, res) => {
                   "status","long_text7","text86","formula",
                   "date4","date_mkx4g1zc","dropdown3",
                   "status_1","dropdown2","person","files","${INSTRUCTIONS_COLUMN}","${AGENT_STATE_COLUMN}","${TEMPLATE_COLUMN}"
-                ]) { id text value }
+                ]) {
+                  id text value
+                  ... on FormulaValue { display_value }
+                }
               }
             }
           }
         }
       }
-    `, { boardId: BOARD_ID });
+    `, { boardId: BOARD_ID }, "2025-07");
 
     const allGroups = data?.boards?.[0]?.groups ?? [];
     const matched   = allGroups.filter(g => g.title.toLowerCase().includes("new request"));
@@ -797,7 +810,15 @@ app.post("/api/webhook", async (req, res) => {
       const itemId = String(event.pulseId);
       console.log(`[agent] New item ${itemId} — generating first proof`);
 
-      const ticket = await fetchItemById(itemId);
+      let ticket = await fetchItemById(itemId);
+
+      // Formula columns (Job Number) can lag a moment after item creation.
+      // If it's empty on first read, wait briefly and re-fetch once.
+      if (!ticket.jobNumber) {
+        console.log(`[agent] Job Number empty for ${itemId} — retrying once after delay`);
+        await new Promise(r => setTimeout(r, 3000));
+        ticket = await fetchItemById(itemId);
+      }
 
       // Guardrail: only generate when the Instructions column has content
       if (!ticket.instructions || !ticket.instructions.trim()) {
