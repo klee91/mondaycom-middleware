@@ -381,35 +381,29 @@ function parseButtons(html) {
 // Instructions parsing + variable substitution
 // ═════════════════════════════════════════════
 
-// Known structured variable prefixes — lines starting with these are parsed as variables.
-// Everything else is treated as freeform prompt and stored under __freeform__.
-const STRUCTURED_PREFIXES = ["PreheaderText", "PreheaderLink", "BodyText", "Button", "Link", "Color", "Style", "Article", "Title", "WhatsNew", "WhyItMatters", "HeaderImage", "HeaderLink"];
+// Recognised variable names in the Instructions column.
+// Prompt: is the explicit delimiter for freeform agent instructions — stored as __freeform__.
+const VARIABLE_NAMES = ["PreheaderText", "PreheaderLink", "BodyText", "HeaderImage", "HeaderLink", "Prompt"];
 
 function parseInstructions(instructions) {
   const vars = {};
   if (!instructions) return vars;
 
-  const VARIABLE_NAMES = ["PreheaderText", "PreheaderLink", "BodyText", "HeaderImage", "HeaderLink"];
   const pattern = new RegExp(
-    `(${VARIABLE_NAMES.join("|")})\\s*:\\s*"?([^"\\n]*(?:\\n(?!(?:${VARIABLE_NAMES.join("|")})\\s*:)[^\\n]*)*)"?`,
+    `(${VARIABLE_NAMES.join("|")})\s*:\s*([\s\S]*?)(?=(?:${VARIABLE_NAMES.join("|")})\s*:|$)`,
     "gi"
   );
   let match;
   while ((match = pattern.exec(instructions)) !== null) {
     const key = match[1].trim();
     const val = match[2].trim().replace(/^"|"$/g, "");
-    if (key && val) vars[key] = val;
-  }
-
-  // Extract freeform lines — anything that doesn't start with a known structured prefix
-  const prefixPattern = new RegExp(`^(${STRUCTURED_PREFIXES.join("|")})\\s*:`, "i");
-  const freeformLines = instructions
-    .split("\n")
-    .map(l => l.trim())
-    .filter(l => l.length > 0 && !prefixPattern.test(l));
-
-  if (freeformLines.length > 0) {
-    vars["__freeform__"] = freeformLines.join("\n");
+    if (!key || !val) continue;
+    // Prompt: maps to __freeform__ — passed directly to Claude as agent instructions
+    if (key.toLowerCase() === "prompt") {
+      vars["__freeform__"] = val;
+    } else {
+      vars[key] = val;
+    }
   }
 
   return vars;
