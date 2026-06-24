@@ -39,7 +39,7 @@ const INSTRUCTIONS_COLUMN = "long_text_mm47njms"; // Instructions column
 const TEMPLATE_COLUMN = "dropdown_mm4d2e9v"; // Template dropdown column
 
 
-const CONTENT_VARIABLES = ["PreheaderText", "BodyText", "Subject"];
+const CONTENT_VARIABLES = ["PreheaderText", "Subject"];
 
 const BUTTON_COLORS = {
   "purple": "#72246c", "light purple": "#86387f", "green": "#48a23f", "navy": "#0f206c",
@@ -335,28 +335,17 @@ function buildButton(text, url, colorName, style = "solid") {
   return `<table align="center" border="0" cellpadding="0" cellspacing="0" style="margin:20px auto;"><tbody><tr><td align="center" bgcolor="${bg}" style="border-radius:3px;background:${bg};"><a href="${url}" style="font-size:16px;font-family:Roboto,Arial,Helvetica,sans-serif;border-radius:3px;padding:12px 18px;border:1px solid ${color};display:inline-block;text-decoration:none;color:${txt};font-weight:300;" target="_blank">${text}</a></td></tr></tbody></table>`;
 }
 
-function parseButtons(html) {
-  const blockPattern = /Button:\s*(.+?)\s*[\r\n]+((?:\s*(?:Link|Color|Style):\s*.+[\r\n]*){1,3})/gi;
-  return html.replace(blockPattern, (match, btnText, rest) => {
-    const link  = (rest.match(/Link:\s*(\S+)/i)  || [])[1];
-    const color = (rest.match(/Color:\s*(.+)/i)  || [])[1];
-    const style = (rest.match(/Style:\s*(\w+)/i) || [])[1];
-    if (!link) return match;
-    return buildButton(btnText.trim(), link.trim(), color && color.trim(), style && style.trim());
-  });
-}
-
 // ═════════════════════════════════════════════
 // Instructions parsing + variable substitution
 // ═════════════════════════════════════════════
 
-// CAPTURE_LABELS are stored as variables. Prompt: maps to __freeform__.
-// BLOCK_LABELS (Button blocks, Article blocks) are handled elsewhere but must
-// still act as BOUNDARIES so a preceding value (e.g. BodyText) stops at them
-// instead of swallowing the whole block.
-const CAPTURE_LABELS = ["PreheaderText", "PreheaderLink", "BodyText", "HeaderImage", "HeaderLink", "Prompt"];
-const BLOCK_LABELS   = ["Button", "Link", "Color", "Style", "Article", "Title", "WhatsNew", "WhyItMatters"];
-const BOUNDARY_LABELS = [...CAPTURE_LABELS, ...BLOCK_LABELS];
+// TOP-LEVEL labels in the Instructions column. These are the only boundaries.
+// BodyContent is a mixed region: after "BodyContent:" the value may contain a
+// free mix of plain text and inline Button blocks, rendered IN ORDER. Button/
+// Link/Color/Style are NOT top-level labels — they live inside BodyContent.
+// BodyText is kept as a backward-compatible alias for BodyContent.
+// Prompt: maps to __freeform__ (agent instructions).
+const CAPTURE_LABELS = ["PreheaderText", "PreheaderLink", "HeaderImage", "HeaderLink", "BodyContent", "BodyText", "Prompt"];
 // Back-compat alias
 const VARIABLE_NAMES = CAPTURE_LABELS;
 
@@ -364,67 +353,83 @@ function parseInstructions(instructions) {
   const vars = {};
   if (!instructions) return vars;
 
-  const covered = []; // [start, end) ranges consumed by labels or button blocks
-
-  // Capture labeled variables; each value runs until the next KNOWN label (capture or block) or end
   const pattern = new RegExp(
-    `(${CAPTURE_LABELS.join("|")})\\s*:\\s*([\\s\\S]*?)(?=(?:${BOUNDARY_LABELS.join("|")})\\s*:|$)`,
+    `(${CAPTURE_LABELS.join("|")})\\s*:\\s*([\\s\\S]*?)(?=(?:${CAPTURE_LABELS.join("|")})\\s*:|$)`,
     "gi"
   );
   let match;
+  let firstLabelIndex = -1;
   while ((match = pattern.exec(instructions)) !== null) {
-    covered.push([match.index, match.index + match[0].length]);
+    if (firstLabelIndex === -1) firstLabelIndex = match.index;
     const key = match[1].trim();
     const val = match[2].trim().replace(/^"|"$/g, "");
-    if (!key || !val) continue;
-    // Prompt: maps to __freeform__ — passed directly to Claude as agent instructions
-    if (key.toLowerCase() === "prompt") {
-      vars["__freeform__"] = val;
-    } else {
+    if (!key) continue;
+    const lk = key.toLowerCase();
+    if (lk === "prompt") {
+      if (val) vars["__freeform__"] = val;
+    } else if (lk === "bodycontent" || lk === "bodytext") {
+      // Merge body blocks (and normalise BodyText → BodyContent)
+      if (val) vars["BodyContent"] = vars["BodyContent"] ? `${vars["BodyContent"]}\n\n${val}` : val;
+    } else if (val) {
       vars[key] = val;
     }
   }
 
-  // Mark Button blocks as covered so their raw text is never mistaken for body copy
-  const buttonPattern = /Button:\s*(.+?)[\r\n]+((?:\s*(?:Link|Color|Style):\s*.+[\r\n]*){1,3})/gi;
-  let b;
-  while ((b = buttonPattern.exec(instructions)) !== null) {
-    covered.push([b.index, b.index + b[0].length]);
-  }
-
-  // Orphan text = anything not under a label and not inside a button block.
-  // Treat it as additional body copy (e.g. a sign-off) and append to BodyText
-  // so it is neither lost nor rendered as raw "Label:" text.
-  covered.sort((a, z) => a[0] - z[0]);
-  let cursor = 0;
-  const orphanParts = [];
-  for (const [s, e] of covered) {
-    if (s > cursor) orphanParts.push(instructions.slice(cursor, s));
-    cursor = Math.max(cursor, e);
-  }
-  if (cursor < instructions.length) orphanParts.push(instructions.slice(cursor));
-  const orphan = orphanParts.join("\n").trim();
-
-  if (orphan) {
-    vars["BodyText"] = vars["BodyText"] ? `${vars["BodyText"]}\n\n${orphan}` : orphan;
+  // Any text before the first recognised label is treated as leading body copy.
+  if (firstLabelIndex > 0) {
+    const lead = instructions.slice(0, firstLabelIndex).trim();
+    if (lead) vars["BodyContent"] = vars["BodyContent"] ? `${lead}\n\n${vars["BodyContent"]}` : lead;
+  } else if (firstLabelIndex === -1) {
+    // No labels at all — the entire field is body content
+    const all = instructions.trim();
+    if (all) vars["BodyContent"] = all;
   }
 
   return vars;
 }
 
-// Insert content immediately before the footer so generated elements never
-// land below it. Order of preference for the insertion point:
-//   1. <!-- START FOOTER -->   (protected footer marker)
-//   2. </body>                 (last resort)
-function insertBeforeFooter(html, content) {
-  const footerMarker = html.search(/<!--\s*START FOOTER\s*-->/i);
-  if (footerMarker !== -1) {
-    return html.slice(0, footerMarker) + content + "\n" + html.slice(footerMarker);
+// ─────────────────────────────────────────────
+// BodyContent rendering: turn a mixed text + Button-block region into HTML,
+// preserving the order in which elements were written.
+// ─────────────────────────────────────────────
+const BODY_PARAGRAPH_STYLE = "margin:0 0 10px 0;font-family:'Roboto',Arial,Helvetica,sans-serif;font-size:16px;font-weight:300;line-height:22px;color:#000000;";
+
+function renderTextSegment(text) {
+  const trimmed = (text || "").trim();
+  if (!trimmed) return "";
+  // Blank line → new paragraph; single newline → <br>
+  return trimmed
+    .split(/\n{2,}/)
+    .map(p => `<p style="${BODY_PARAGRAPH_STYLE}">${p.trim().replace(/\n/g, "<br>")}</p>`)
+    .join("\n");
+}
+
+function renderBodyContent(content) {
+  if (!content) return "";
+  const buttonPattern = /Button:\s*(.+?)[\r\n]+((?:\s*(?:Link|Color|Style):\s*.+[\r\n]*){1,3})/gi;
+  let out = "";
+  let lastIndex = 0;
+  let m;
+  while ((m = buttonPattern.exec(content)) !== null) {
+    // Text before this button block
+    out += renderTextSegment(content.slice(lastIndex, m.index));
+    // The button itself
+    const btnText = m[1].trim();
+    const rest    = m[2];
+    const link    = (rest.match(/Link:\s*(\S+)/i)  || [])[1];
+    const color   = (rest.match(/Color:\s*(.+)/i)  || [])[1];
+    const style   = (rest.match(/Style:\s*(\w+)/i) || [])[1];
+    if (link) {
+      out += "\n" + buildButton(btnText, link.trim(), color && color.trim(), style && style.trim()) + "\n";
+    } else {
+      // Malformed button block — keep as text rather than dropping it
+      out += renderTextSegment(m[0]);
+    }
+    lastIndex = m.index + m[0].length;
   }
-  if (/<\/body>/i.test(html)) {
-    return html.replace(/<\/body>/i, content + "\n</body>");
-  }
-  return html + "\n" + content;
+  // Trailing text after the last button
+  out += renderTextSegment(content.slice(lastIndex));
+  return out;
 }
 
 function applyVariables(html, vars, instructions = "") {
@@ -441,7 +446,17 @@ function applyVariables(html, vars, instructions = "") {
   for (const key of CONTENT_VARIABLES) {
     if (vars[key] !== undefined) out = out.replace(new RegExp(`\\{\\{${key}\\}\\}`, "g"), vars[key]);
   }
-  if (vars["BodyText"]) out = out.replace(/BODY_CONTENT_HERE/g, vars["BodyText"]);
+
+  // Body content: render the mixed text + inline-Button region in order, then
+  // drop it into the body placeholder(s). Buttons are NOT injected separately —
+  // they appear exactly where the marketer placed them within BodyContent.
+  if (vars["BodyContent"]) {
+    const renderedBody = renderBodyContent(vars["BodyContent"]);
+    out = out
+      .replace(/BODY_CONTENT_HERE/g, renderedBody)
+      .replace(/\{\{BodyContent\}\}/g, renderedBody)
+      .replace(/\{\{BodyText\}\}/g, renderedBody);
+  }
 
   // Job Number: support {{JobNumber}}, JOB_NUMBER_HERE, and plain JOB_NUMBER tokens
   if (vars["JobNumber"]) {
@@ -449,31 +464,6 @@ function applyVariables(html, vars, instructions = "") {
       .replace(/\{\{JobNumber\}\}/g, vars["JobNumber"])
       .replace(/JOB_NUMBER_HERE/g, vars["JobNumber"])
       .replace(/\bJOB_NUMBER\b/g, vars["JobNumber"]);
-  }
-
-  // Parse Button: blocks from the Instructions column and inject into the template.
-  // Replaces BUTTON_TEXT placeholder if present, otherwise appends before </body>.
-  if (instructions) {
-    const buttonPattern = /Button:\s*(.+?)[\r\n]+((?:\s*(?:Link|Color|Style):\s*.+[\r\n]*){1,3})/gi;
-    let buttonMatch;
-    const renderedButtons = [];
-    while ((buttonMatch = buttonPattern.exec(instructions)) !== null) {
-      const btnText = buttonMatch[1].trim();
-      const rest    = buttonMatch[2];
-      const link    = (rest.match(/Link:\s*(\S+)/i)  || [])[1];
-      const color   = (rest.match(/Color:\s*(.+)/i)  || [])[1];
-      const style   = (rest.match(/Style:\s*(\w+)/i) || [])[1];
-      if (link) renderedButtons.push(buildButton(btnText, link.trim(), color && color.trim(), style && style.trim()));
-    }
-    if (renderedButtons.length > 0) {
-      const combined = renderedButtons.join("\n");
-      if (/BUTTON_TEXT/i.test(out)) {
-        out = out.replace(/BUTTON_TEXT/gi, combined);
-      } else {
-        // No placeholder — inject just above the footer, never after it
-        out = insertBeforeFooter(out, combined);
-      }
-    }
   }
 
   return out;
@@ -538,7 +528,7 @@ async function generateHTML(ticket, templateName) {
   let html = applyVariables(templateHtml, vars, ticket.instructions || "");
 
   const stillMissing = [];
-  if (/BODY_CONTENT_HERE/.test(html) || /\{\{BodyText\}\}/.test(html)) stillMissing.push("BodyText");
+  if (/BODY_CONTENT_HERE/.test(html) || /\{\{BodyContent\}\}/.test(html) || /\{\{BodyText\}\}/.test(html)) stillMissing.push("BodyContent");
   if (/\{\{PreheaderText\}\}/.test(html)) stillMissing.push("PreheaderText");
 
   if (stillMissing.length > 0) {
