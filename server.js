@@ -669,7 +669,7 @@ async function persistAgentState(itemId, revision, history, currentHtml) {
 async function postUpdate(itemId, body, mentionIds = []) {
   const mentionsList = mentionIds.map(id => ({ id: parseInt(id, 10), type: "User" }));
   await mondayQuery(`
-    mutation PostUpdate($itemId: ID!, $body: String!, $mentionsList: [MentionInput!]) {
+    mutation PostUpdate($itemId: ID!, $body: String!, $mentionsList: [MentionType!]) {
       create_update(item_id: $itemId, body: $body, mentions_list: $mentionsList) { id }
     }
   `, { itemId, body, mentionsList: mentionsList.length ? mentionsList : undefined }, "2025-07");
