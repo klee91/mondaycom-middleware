@@ -9,6 +9,7 @@
  *   - Footer + Pardot-tag protection, brand style enforcement
  *   - Stateful agent webhook: item created → proof; @agent feedback → revise;
  *     Status=Approved → silent finalize
+ *   - Generation model: claude-opus-4-6 (swap to claude-haiku-4-5-20251001 once fine-tuned)
  *
  * Required env vars:
  *   MONDAY_API_TOKEN, ANTHROPIC_API_KEY, BOARD_ID
@@ -448,7 +449,7 @@ async function generateHTML(ticket, templateName) {
 
   if (stillMissing.length > 0) {
     const message = await anthropic.messages.create({
-      model: "claude-haiku-4-5-20251001",
+      model: "claude-opus-4-6",
       max_tokens: 8000,
       system: AI_SYSTEM_PROMPT,
       messages: [{
@@ -492,7 +493,7 @@ async function reviseHTML(currentHtml, feedback, history) {
   const historyText = history.length ? history.map((h, i) => `Round ${i + 1}: ${h}`).join("\n") : "(none)";
 
   const message = await anthropic.messages.create({
-    model: "claude-haiku-4-5-20251001",
+    model: "claude-opus-4-6",
     max_tokens: 8000,
     system: AI_SYSTEM_PROMPT,
     messages: [{
