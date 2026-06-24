@@ -71,7 +71,6 @@ CPA.COM BRAND STANDARDS (STRICT — match exactly, no deviation):
 
 CONTENT PLACEHOLDERS (only replace these):
 - BODY_CONTENT_HERE → email body copy written from the ticket description.
-- BUTTON_TEXT → relevant CTA based on ticket context.
 - JOB_NUMBER_HERE / JOB_NUMBER → the job number, or remove the line if blank.
 
 TONE: professional, clear, appropriate for accounting and finance professionals. If the description says TBD or TBC, write appropriate placeholder copy based on the subject line and product.`;
@@ -390,7 +389,7 @@ function parseInstructions(instructions) {
   if (!instructions) return vars;
 
   const pattern = new RegExp(
-    `(${VARIABLE_NAMES.join("|")})\s*:\s*([\s\S]*?)(?=(?:${VARIABLE_NAMES.join("|")})\s*:|$)`,
+    `(${VARIABLE_NAMES.join("|")})\\s*:\\s*([\\s\\S]*?)(?=(?:${VARIABLE_NAMES.join("|")})\\s*:|$)`,
     "gi"
   );
   let match;
@@ -409,7 +408,7 @@ function parseInstructions(instructions) {
   return vars;
 }
 
-function applyVariables(html, vars) {
+function applyVariables(html, vars, instructions = "") {
   let out = html;
 
   if (vars["PreheaderText"] !== undefined) {
@@ -433,7 +432,31 @@ function applyVariables(html, vars) {
       .replace(/\bJOB_NUMBER\b/g, vars["JobNumber"]);
   }
 
-  out = parseButtons(out);
+  // Parse Button: blocks from the Instructions column and inject into the template.
+  // Replaces BUTTON_TEXT placeholder if present, otherwise appends before </body>.
+  if (instructions) {
+    const buttonPattern = /Button:\s*(.+?)[\r\n]+((?:\s*(?:Link|Color|Style):\s*.+[\r\n]*){1,3})/gi;
+    let buttonMatch;
+    const renderedButtons = [];
+    while ((buttonMatch = buttonPattern.exec(instructions)) !== null) {
+      const btnText = buttonMatch[1].trim();
+      const rest    = buttonMatch[2];
+      const link    = (rest.match(/Link:\s*(\S+)/i)  || [])[1];
+      const color   = (rest.match(/Color:\s*(.+)/i)  || [])[1];
+      const style   = (rest.match(/Style:\s*(\w+)/i) || [])[1];
+      if (link) renderedButtons.push(buildButton(btnText, link.trim(), color && color.trim(), style && style.trim()));
+    }
+    if (renderedButtons.length > 0) {
+      const combined = renderedButtons.join("\n");
+      if (/BUTTON_TEXT/i.test(out)) {
+        out = out.replace(/BUTTON_TEXT/gi, combined);
+      } else {
+        // No placeholder — inject before </body>
+        out = out.replace("</body>", combined + "\n</body>");
+      }
+    }
+  }
+
   return out;
 }
 
@@ -478,12 +501,11 @@ async function generateHTML(ticket, templateName) {
   vars["Subject"]   = ticket.subjectLine || ticket.name || "";
   vars["JobNumber"] = ticket.jobNumber || "";
 
-  let html = applyVariables(templateHtml, vars);
+  let html = applyVariables(templateHtml, vars, ticket.instructions || "");
 
   const stillMissing = [];
   if (/BODY_CONTENT_HERE/.test(html) || /\{\{BodyText\}\}/.test(html)) stillMissing.push("BodyText");
   if (/\{\{PreheaderText\}\}/.test(html)) stillMissing.push("PreheaderText");
-  if (/BUTTON_TEXT/.test(html)) stillMissing.push("ButtonText");
 
   if (stillMissing.length > 0) {
     const message = await anthropic.messages.create({
