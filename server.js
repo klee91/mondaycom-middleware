@@ -354,9 +354,15 @@ function parseButtons(html) {
 // ═════════════════════════════════════════════
 // Instructions parsing + variable substitution
 // ═════════════════════════════════════════════
+
+// Known structured variable prefixes — lines starting with these are parsed as variables.
+// Everything else is treated as freeform prompt and stored under __freeform__.
+const STRUCTURED_PREFIXES = ["PreheaderText", "PreheaderLink", "BodyText", "Button", "Link", "Color", "Style", "Article", "Title", "WhatsNew", "WhyItMatters"];
+
 function parseInstructions(instructions) {
   const vars = {};
   if (!instructions) return vars;
+
   const VARIABLE_NAMES = ["PreheaderText", "PreheaderLink", "BodyText"];
   const pattern = new RegExp(
     `(${VARIABLE_NAMES.join("|")})\\s*:\\s*"?([^"\\n]*(?:\\n(?!(?:${VARIABLE_NAMES.join("|")})\\s*:)[^\\n]*)*)"?`,
@@ -368,6 +374,18 @@ function parseInstructions(instructions) {
     const val = match[2].trim().replace(/^"|"$/g, "");
     if (key && val) vars[key] = val;
   }
+
+  // Extract freeform lines — anything that doesn't start with a known structured prefix
+  const prefixPattern = new RegExp(`^(${STRUCTURED_PREFIXES.join("|")})\\s*:`, "i");
+  const freeformLines = instructions
+    .split("\n")
+    .map(l => l.trim())
+    .filter(l => l.length > 0 && !prefixPattern.test(l));
+
+  if (freeformLines.length > 0) {
+    vars["__freeform__"] = freeformLines.join("\n");
+  }
+
   return vars;
 }
 
@@ -464,7 +482,7 @@ Job Number: ${vars["JobNumber"]}
 Description: ${ticket.description || "No description provided."}
 Category: ${ticket.category || ""}
 Product: ${ticket.product || ""}
-
+${vars["__freeform__"] ? `\nAdditional instructions from the requestor (apply these when generating content):\n${vars["__freeform__"]}` : ""}
 HTML TEMPLATE (partially populated — only fill the remaining placeholders listed above):
 ${html}`,
       }],
@@ -488,7 +506,7 @@ ${html}`,
 // ═════════════════════════════════════════════
 // Revise HTML (agent feedback loop)
 // ═════════════════════════════════════════════
-async function reviseHTML(currentHtml, feedback, history) {
+async function reviseHTML(currentHtml, feedback, history, freeform = "") {
   const originalFooter = extractFooter(currentHtml);
   const historyText = history.length ? history.map((h, i) => `Round ${i + 1}: ${h}`).join("\n") : "(none)";
 
@@ -499,7 +517,7 @@ async function reviseHTML(currentHtml, feedback, history) {
     messages: [{
       role: "user",
       content: `You previously generated this email proof. The requestor has reviewed it and given feedback. Apply ONLY the requested changes while keeping everything else intact and following all CPA.com brand standards.
-
+${freeform ? `\nSTANDING INSTRUCTIONS FROM REQUESTOR (remain in effect across all revisions):\n${freeform}\n` : ""}
 PRIOR FEEDBACK ROUNDS:
 ${historyText}
 
@@ -773,7 +791,8 @@ app.post("/api/webhook", async (req, res) => {
         return;
       }
 
-      const revised  = await reviseHTML(baseHtml, feedback, meta.history || []);
+      const ticketVars = parseInstructions(ticket.instructions);
+      const revised  = await reviseHTML(baseHtml, feedback, meta.history || [], ticketVars["__freeform__"] || "");
       const newRev   = (meta.revision || 1) + 1;
       const fileName = `${ticket.name.replace(/\s+/g, "_")}_${ticket.jobNumber || itemId}_v${newRev}.html`;
 
