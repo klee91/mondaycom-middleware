@@ -49,8 +49,8 @@ const BUTTON_COLORS = {
 const AI_SYSTEM_PROMPT = `You are an email template generator for CPA.com. Populate the HTML template with ticket data, strictly following the CPA.com brand standards below.
 
 OUTPUT RULES:
-- Your response must start with < and end with >. Nothing before the opening < and nothing after the closing >.
-- Do NOT wrap output in markdown code fences. Do NOT include \`\`\`html or \`\`\` anywhere.
+- Output ONLY the raw HTML. Absolutely nothing before the first < and nothing after the last >.
+- No preamble, no commentary, no sign-off, no markdown fences. The response is the HTML document and nothing else.
 - Keep ALL HTML structure, styles, images, and links completely intact.
 
 PROTECTED — NEVER MODIFY:
@@ -169,10 +169,10 @@ async function fetchTemplateFromSharePoint(templateName) {
 // ═════════════════════════════════════════════
 // Monday GraphQL helper
 // ═════════════════════════════════════════════
-async function mondayQuery(query, variables = {}) {
+async function mondayQuery(query, variables = {}, apiVersion = "2024-01") {
   const res = await fetch(MONDAY_API_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: process.env.MONDAY_API_TOKEN, "API-Version": "2024-01" },
+    headers: { "Content-Type": "application/json", Authorization: process.env.MONDAY_API_TOKEN, "API-Version": apiVersion },
     body: JSON.stringify({ query, variables }),
   });
   const data = await res.json();
@@ -489,6 +489,21 @@ async function resolveTemplateName(ticket) {
 }
 
 // ═════════════════════════════════════════════
+// Strip any prose preamble/postamble Claude may have added around the HTML.
+// Finds the first < and last > in the response and returns only that slice.
+// Falls back to the original if no valid HTML envelope is found.
+// ═════════════════════════════════════════════
+function extractHtml(raw, fallback) {
+  const start = raw.indexOf("<");
+  const end   = raw.lastIndexOf(">");
+  if (start === -1 || end === -1 || end < start) {
+    console.warn("extractHtml: no valid HTML envelope found in Claude response — using fallback");
+    return fallback;
+  }
+  return raw.slice(start, end + 1).trim();
+}
+
+// ═════════════════════════════════════════════
 // Generate HTML (first proof)
 // ═════════════════════════════════════════════
 async function generateHTML(ticket, templateName) {
@@ -529,8 +544,8 @@ HTML TEMPLATE (partially populated — only fill the remaining placeholders list
 ${html}`,
       }],
     });
-    html = message.content.find(b => b.type === "text")?.text ?? html;
-    html = html.replace(/^```html\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
+    const rawGenerated = message.content.find(b => b.type === "text")?.text ?? "";
+    html = extractHtml(rawGenerated, html);
   }
 
   if (originalFooter && !hasFooter(html)) {
@@ -571,8 +586,8 @@ ${currentHtml}`,
     }],
   });
 
-  let html = message.content.find(b => b.type === "text")?.text ?? currentHtml;
-  html = html.replace(/^```html\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
+  const rawRevised = message.content.find(b => b.type === "text")?.text ?? "";
+  let html = extractHtml(rawRevised, currentHtml);
   if (originalFooter && !hasFooter(html)) html = reattachFooter(html, originalFooter);
   return html;
 }
@@ -657,7 +672,7 @@ async function postUpdate(itemId, body, mentionIds = []) {
     mutation PostUpdate($itemId: ID!, $body: String!, $mentionsList: [MentionInput!]) {
       create_update(item_id: $itemId, body: $body, mentions_list: $mentionsList) { id }
     }
-  `, { itemId, body, mentionsList: mentionsList.length ? mentionsList : undefined });
+  `, { itemId, body, mentionsList: mentionsList.length ? mentionsList : undefined }, "2025-07");
 }
 
 async function findUserIdByName(name) {
