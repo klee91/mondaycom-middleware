@@ -14,7 +14,6 @@
  * Required env vars:
  *   MONDAY_API_TOKEN, ANTHROPIC_API_KEY, BOARD_ID
  *   SHAREPOINT_TENANT_ID, SHAREPOINT_CLIENT_ID, SHAREPOINT_CLIENT_SECRET, SHAREPOINT_DRIVE_ID
- *   HEADER_UPLOAD_FOLDER_URL (SharePoint share link to the target images folder)
  */
 
 const express   = require("express");
@@ -252,78 +251,6 @@ async function downloadMondayAsset(asset) {
   return Buffer.from(await res.arrayBuffer());
 }
 
-// ═════════════════════════════════════════════
-// Header image re-hosting (SharePoint anonymous link)
-// Resolves HEADER_UPLOAD_FOLDER_URL (a SharePoint share link to the target
-// folder, e.g. the NewProductMarketing site's images folder) to its actual
-// driveId + folderId, then uploads there. Resolving the share link directly
-// avoids drive-mismatch issues and works for any site the app can access.
-// ═════════════════════════════════════════════
-let cachedFolderId = null;
-let cachedFolderDriveId = null;
-
-// Encode a SharePoint sharing URL into a Graph share token (u!{base64url}).
-function shareUrlToToken(shareUrl) {
-  const b64 = Buffer.from(shareUrl).toString("base64")
-    .replace(/=+$/, "").replace(/\//g, "_").replace(/\+/g, "-");
-  return "u!" + b64;
-}
-
-async function getHeaderFolder() {
-  if (cachedFolderId && cachedFolderDriveId) return { folderId: cachedFolderId, driveId: cachedFolderDriveId };
-
-  const shareUrl = process.env.HEADER_UPLOAD_FOLDER_URL;
-  if (!shareUrl) throw new Error("No HEADER_UPLOAD_FOLDER_URL set.");
-
-  const token   = await getSharePointToken();
-  const shareId = shareUrlToToken(shareUrl);
-  const res = await fetch(
-    `https://graph.microsoft.com/v1.0/shares/${shareId}/driveItem?$select=id,name,parentReference`,
-    { headers: { Authorization: `Bearer ${token}` } }
-  );
-  if (!res.ok) {
-    let detail = "";
-    try { detail = JSON.stringify((await res.json())?.error || {}); } catch {}
-    throw new Error(`Header folder resolve failed: ${res.status} ${detail}`);
-  }
-  const item = await res.json();
-
-  cachedFolderId      = item.id;
-  cachedFolderDriveId = item.parentReference?.driveId || process.env.SHAREPOINT_DRIVE_ID;
-  console.log(`Resolved header upload folder: "${item.name}" id=${cachedFolderId} drive=${cachedFolderDriveId}`);
-  return { folderId: cachedFolderId, driveId: cachedFolderDriveId };
-}
-
-async function rehostToSharePoint(fileName, buffer) {
-  const token = await getSharePointToken();
-  const { folderId, driveId } = await getHeaderFolder();
-
-  // Upload as a child of the resolved folder: /items/{folderId}:/{fileName}:/content
-  const uploadUrl = `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${folderId}:/${encodeURIComponent(fileName)}:/content`;
-  const upRes = await fetch(uploadUrl, {
-    method: "PUT",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/octet-stream" },
-    body: buffer,
-  });
-  if (!upRes.ok) {
-    let detail = "";
-    try { detail = JSON.stringify((await upRes.json())?.error || {}); } catch {}
-    throw new Error(`SharePoint upload failed: ${upRes.status} ${detail}`);
-  }
-  const uploaded = await upRes.json();
-
-  const linkRes = await fetch(
-    `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${uploaded.id}/createLink`,
-    { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ type: "view", scope: "anonymous" }) }
-  );
-  if (!linkRes.ok) throw new Error(`Share link creation failed: ${linkRes.status}`);
-  const linkData = await linkRes.json();
-
-  let webUrl = linkData?.link?.webUrl || "";
-  if (webUrl && !webUrl.includes("download=1")) webUrl += (webUrl.includes("?") ? "&" : "?") + "download=1";
-  return webUrl;
-}
-
 // Replace the first <img> src in the HTML, and optionally wrap it in an <a> tag.
 // - newUrl: the image src to inject; pass null to leave the existing src unchanged
 // - linkUrl: if provided, wraps the <img> in <a href="linkUrl" ...> (optional)
@@ -345,11 +272,15 @@ function replaceFirstImage(html, newUrl, linkUrl = "") {
 // Behaviour matrix (all conditional):
 //   HeaderImage absent,  HeaderLink absent   → no changes; template header left as-is
 //   HeaderImage provided, HeaderLink absent  → find asset by filename in Files column,
-//                                              re-host to SharePoint, replace <img> src
+//                                              use its Monday public_url as the <img> src
 //   HeaderImage absent,  HeaderLink provided → wrap existing <img> in <a href="HeaderLink">,
 //                                              src left unchanged
-//   HeaderImage provided, HeaderLink provided → find asset by filename, re-host,
-//                                              replace <img> src AND wrap in <a>
+//   HeaderImage provided, HeaderLink provided → find asset by filename, swap <img> src
+//                                              to its public_url AND wrap in <a>
+//
+// NOTE: Monday's public_url is a TEMPORARY, expiring link — fine for proofing,
+// but the production header must point at a permanent marketing.cpa.com asset
+// before the Pardot send.
 async function applyHeaderImage(html, itemId, vars = {}) {
   const headerLink     = (vars["HeaderLink"]  || "").trim();
   const headerFilename = (vars["HeaderImage"] || "").trim();
@@ -367,10 +298,13 @@ async function applyHeaderImage(html, itemId, vars = {}) {
         // Still apply HeaderLink to the existing image if provided
         return headerLink ? replaceFirstImage(html, null, headerLink) : html;
       }
-      const buf       = await downloadMondayAsset(match);
-      const publicUrl = await rehostToSharePoint(`header_${itemId}_${match.name}`, buf);
-      if (!publicUrl) return html;
-      console.log(`Header image re-hosted: ${publicUrl}`);
+      // Use Monday's temporary public URL directly (no SharePoint re-host)
+      const publicUrl = match.public_url || match.url;
+      if (!publicUrl) {
+        console.warn(`Header image "${headerFilename}" has no public URL — header left unchanged.`);
+        return headerLink ? replaceFirstImage(html, null, headerLink) : html;
+      }
+      console.log(`Header image set from Monday public_url (temporary): ${headerFilename}`);
       return replaceFirstImage(html, publicUrl, headerLink);
     } else {
       // HeaderLink only — wrap the existing <img> without touching its src
@@ -416,20 +350,30 @@ function parseButtons(html) {
 // Instructions parsing + variable substitution
 // ═════════════════════════════════════════════
 
-// Recognised variable names in the Instructions column.
-// Prompt: is the explicit delimiter for freeform agent instructions — stored as __freeform__.
-const VARIABLE_NAMES = ["PreheaderText", "PreheaderLink", "BodyText", "HeaderImage", "HeaderLink", "Prompt"];
+// CAPTURE_LABELS are stored as variables. Prompt: maps to __freeform__.
+// BLOCK_LABELS (Button blocks, Article blocks) are handled elsewhere but must
+// still act as BOUNDARIES so a preceding value (e.g. BodyText) stops at them
+// instead of swallowing the whole block.
+const CAPTURE_LABELS = ["PreheaderText", "PreheaderLink", "BodyText", "HeaderImage", "HeaderLink", "Prompt"];
+const BLOCK_LABELS   = ["Button", "Link", "Color", "Style", "Article", "Title", "WhatsNew", "WhyItMatters"];
+const BOUNDARY_LABELS = [...CAPTURE_LABELS, ...BLOCK_LABELS];
+// Back-compat alias
+const VARIABLE_NAMES = CAPTURE_LABELS;
 
 function parseInstructions(instructions) {
   const vars = {};
   if (!instructions) return vars;
 
+  const covered = []; // [start, end) ranges consumed by labels or button blocks
+
+  // Capture labeled variables; each value runs until the next KNOWN label (capture or block) or end
   const pattern = new RegExp(
-    `(${VARIABLE_NAMES.join("|")})\\s*:\\s*([\\s\\S]*?)(?=(?:${VARIABLE_NAMES.join("|")})\\s*:|$)`,
+    `(${CAPTURE_LABELS.join("|")})\\s*:\\s*([\\s\\S]*?)(?=(?:${BOUNDARY_LABELS.join("|")})\\s*:|$)`,
     "gi"
   );
   let match;
   while ((match = pattern.exec(instructions)) !== null) {
+    covered.push([match.index, match.index + match[0].length]);
     const key = match[1].trim();
     const val = match[2].trim().replace(/^"|"$/g, "");
     if (!key || !val) continue;
@@ -439,6 +383,30 @@ function parseInstructions(instructions) {
     } else {
       vars[key] = val;
     }
+  }
+
+  // Mark Button blocks as covered so their raw text is never mistaken for body copy
+  const buttonPattern = /Button:\s*(.+?)[\r\n]+((?:\s*(?:Link|Color|Style):\s*.+[\r\n]*){1,3})/gi;
+  let b;
+  while ((b = buttonPattern.exec(instructions)) !== null) {
+    covered.push([b.index, b.index + b[0].length]);
+  }
+
+  // Orphan text = anything not under a label and not inside a button block.
+  // Treat it as additional body copy (e.g. a sign-off) and append to BodyText
+  // so it is neither lost nor rendered as raw "Label:" text.
+  covered.sort((a, z) => a[0] - z[0]);
+  let cursor = 0;
+  const orphanParts = [];
+  for (const [s, e] of covered) {
+    if (s > cursor) orphanParts.push(instructions.slice(cursor, s));
+    cursor = Math.max(cursor, e);
+  }
+  if (cursor < instructions.length) orphanParts.push(instructions.slice(cursor));
+  const orphan = orphanParts.join("\n").trim();
+
+  if (orphan) {
+    vars["BodyText"] = vars["BodyText"] ? `${vars["BodyText"]}\n\n${orphan}` : orphan;
   }
 
   return vars;
