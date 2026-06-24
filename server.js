@@ -14,7 +14,7 @@
  * Required env vars:
  *   MONDAY_API_TOKEN, ANTHROPIC_API_KEY, BOARD_ID
  *   SHAREPOINT_TENANT_ID, SHAREPOINT_CLIENT_ID, SHAREPOINT_CLIENT_SECRET, SHAREPOINT_DRIVE_ID
- *   HEADER_UPLOAD_FOLDER_URL (share link to the headers_banners folder)
+ *   HEADER_UPLOAD_FOLDER_URL (SharePoint share link to the target images folder)
  */
 
 const express   = require("express");
@@ -56,6 +56,7 @@ OUTPUT RULES:
 PROTECTED — NEVER MODIFY:
 - Any existing {{...}} or {{{...}}} tokens are Pardot merge tags. Leave them exactly as-is.
 - The section between <!-- START FOOTER --> and <!-- END FOOTER --> must remain completely intact.
+- ALL generated and body content (copy, buttons, articles, CTAs, etc.) MUST appear ABOVE the <!-- START FOOTER --> marker — between the header and the footer. Never place any content after <!-- END FOOTER -->. The footer is always the last block in the email body.
 - Pre-built buttons already in the template (such as multi-cell "Read more" bracket buttons with side images) must keep their structure. Only change their href or link text if explicitly instructed.
 
 CPA.COM BRAND STANDARDS (STRICT — match exactly, no deviation):
@@ -253,26 +254,43 @@ async function downloadMondayAsset(asset) {
 
 // ═════════════════════════════════════════════
 // Header image re-hosting (SharePoint anonymous link)
+// Resolves HEADER_UPLOAD_FOLDER_URL (a SharePoint share link to the target
+// folder, e.g. the NewProductMarketing site's images folder) to its actual
+// driveId + folderId, then uploads there. Resolving the share link directly
+// avoids drive-mismatch issues and works for any site the app can access.
 // ═════════════════════════════════════════════
 let cachedFolderId = null;
 let cachedFolderDriveId = null;
+
+// Encode a SharePoint sharing URL into a Graph share token (u!{base64url}).
+function shareUrlToToken(shareUrl) {
+  const b64 = Buffer.from(shareUrl).toString("base64")
+    .replace(/=+$/, "").replace(/\//g, "_").replace(/\+/g, "-");
+  return "u!" + b64;
+}
+
 async function getHeaderFolder() {
   if (cachedFolderId && cachedFolderDriveId) return { folderId: cachedFolderId, driveId: cachedFolderDriveId };
 
   const shareUrl = process.env.HEADER_UPLOAD_FOLDER_URL;
   if (!shareUrl) throw new Error("No HEADER_UPLOAD_FOLDER_URL set.");
-  const b64 = Buffer.from(shareUrl).toString("base64").replace(/=+$/, "").replace(/\//g, "_").replace(/\+/g, "-");
-  const shareId = "u!" + b64;
 
-  const token = await getSharePointToken();
-  // Expand parentReference so we get the folder's actual driveId — it may differ from SHAREPOINT_DRIVE_ID
-  const res   = await fetch(`https://graph.microsoft.com/v1.0/shares/${shareId}/driveItem?$select=id,name,parentReference`, { headers: { Authorization: `Bearer ${token}` } });
-  if (!res.ok) throw new Error(`Folder resolve failed: ${res.status}`);
+  const token   = await getSharePointToken();
+  const shareId = shareUrlToToken(shareUrl);
+  const res = await fetch(
+    `https://graph.microsoft.com/v1.0/shares/${shareId}/driveItem?$select=id,name,parentReference`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  if (!res.ok) {
+    let detail = "";
+    try { detail = JSON.stringify((await res.json())?.error || {}); } catch {}
+    throw new Error(`Header folder resolve failed: ${res.status} ${detail}`);
+  }
   const item = await res.json();
 
   cachedFolderId      = item.id;
   cachedFolderDriveId = item.parentReference?.driveId || process.env.SHAREPOINT_DRIVE_ID;
-  console.log(`Resolved header upload folder: id=${cachedFolderId} drive=${cachedFolderDriveId}`);
+  console.log(`Resolved header upload folder: "${item.name}" id=${cachedFolderId} drive=${cachedFolderDriveId}`);
   return { folderId: cachedFolderId, driveId: cachedFolderDriveId };
 }
 
@@ -280,13 +298,18 @@ async function rehostToSharePoint(fileName, buffer) {
   const token = await getSharePointToken();
   const { folderId, driveId } = await getHeaderFolder();
 
+  // Upload as a child of the resolved folder: /items/{folderId}:/{fileName}:/content
   const uploadUrl = `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${folderId}:/${encodeURIComponent(fileName)}:/content`;
   const upRes = await fetch(uploadUrl, {
     method: "PUT",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/octet-stream" },
     body: buffer,
   });
-  if (!upRes.ok) throw new Error(`SharePoint upload failed: ${upRes.status}`);
+  if (!upRes.ok) {
+    let detail = "";
+    try { detail = JSON.stringify((await upRes.json())?.error || {}); } catch {}
+    throw new Error(`SharePoint upload failed: ${upRes.status} ${detail}`);
+  }
   const uploaded = await upRes.json();
 
   const linkRes = await fetch(
@@ -421,6 +444,21 @@ function parseInstructions(instructions) {
   return vars;
 }
 
+// Insert content immediately before the footer so generated elements never
+// land below it. Order of preference for the insertion point:
+//   1. <!-- START FOOTER -->   (protected footer marker)
+//   2. </body>                 (last resort)
+function insertBeforeFooter(html, content) {
+  const footerMarker = html.search(/<!--\s*START FOOTER\s*-->/i);
+  if (footerMarker !== -1) {
+    return html.slice(0, footerMarker) + content + "\n" + html.slice(footerMarker);
+  }
+  if (/<\/body>/i.test(html)) {
+    return html.replace(/<\/body>/i, content + "\n</body>");
+  }
+  return html + "\n" + content;
+}
+
 function applyVariables(html, vars, instructions = "") {
   let out = html;
 
@@ -464,8 +502,8 @@ function applyVariables(html, vars, instructions = "") {
       if (/BUTTON_TEXT/i.test(out)) {
         out = out.replace(/BUTTON_TEXT/gi, combined);
       } else {
-        // No placeholder — inject before </body>
-        out = out.replace("</body>", combined + "\n</body>");
+        // No placeholder — inject just above the footer, never after it
+        out = insertBeforeFooter(out, combined);
       }
     }
   }
