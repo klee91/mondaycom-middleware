@@ -234,13 +234,6 @@ async function fetchTicketFiles(itemId) {
   return data?.items?.[0]?.assets ?? [];
 }
 
-function pickHeaderImage(assets) {
-  const IMAGE_EXT = ["png", "jpg", "jpeg", "gif"];
-  return assets.find(a => {
-    const ext = (a.file_extension || a.name.split(".").pop() || "").toLowerCase();
-    return IMAGE_EXT.includes(ext);
-  });
-}
 
 async function downloadMondayAsset(asset) {
   const src = asset.public_url || asset.url;
@@ -296,25 +289,58 @@ async function rehostToSharePoint(fileName, buffer) {
   return webUrl;
 }
 
-function replaceFirstImage(html, newUrl) {
+// Replace the first <img> src in the HTML, and optionally wrap it in an <a> tag.
+// - newUrl: the image src to inject; pass null to leave the existing src unchanged
+// - linkUrl: if provided, wraps the <img> in <a href="linkUrl" ...> (optional)
+function replaceFirstImage(html, newUrl, linkUrl = "") {
   let replaced = false;
-  return html.replace(/(<img\b[^>]*\bsrc=")([^"]*)(")/i, (m, pre, _src, post) => {
+  return html.replace(/(<img\b[^>]*\bsrc=")([^"]*)("[^>]*>)/i, (m, pre, existingSrc, post) => {
     if (replaced) return m;
     replaced = true;
-    return pre + newUrl + post;
+    const resolvedSrc = newUrl !== null ? newUrl : existingSrc;
+    const img = pre + resolvedSrc + post;
+    if (linkUrl) {
+      return `<a href="${linkUrl}" target="_blank" style="display:block;border:0;text-decoration:none;">${img}</a>`;
+    }
+    return img;
   });
 }
 
-async function applyHeaderImage(html, itemId) {
+// Apply header image and/or header link to the email HTML.
+// Behaviour matrix (all conditional):
+//   HeaderImage absent,  HeaderLink absent   → no changes; template header left as-is
+//   HeaderImage provided, HeaderLink absent  → find asset by filename in Files column,
+//                                              re-host to SharePoint, replace <img> src
+//   HeaderImage absent,  HeaderLink provided → wrap existing <img> in <a href="HeaderLink">,
+//                                              src left unchanged
+//   HeaderImage provided, HeaderLink provided → find asset by filename, re-host,
+//                                              replace <img> src AND wrap in <a>
+async function applyHeaderImage(html, itemId, vars = {}) {
+  const headerLink     = (vars["HeaderLink"]  || "").trim();
+  const headerFilename = (vars["HeaderImage"] || "").trim();
+
+  // Nothing to do — leave the template header completely untouched
+  if (!headerFilename && !headerLink) return html;
+
   try {
-    const assets = await fetchTicketFiles(itemId);
-    const header = pickHeaderImage(assets);
-    if (!header) return html;
-    const buf       = await downloadMondayAsset(header);
-    const publicUrl = await rehostToSharePoint(`header_${itemId}_${header.name}`, buf);
-    if (!publicUrl) return html;
-    console.log(`Header image re-hosted: ${publicUrl}`);
-    return replaceFirstImage(html, publicUrl);
+    if (headerFilename) {
+      // Look up the named file in the Files column
+      const assets = await fetchTicketFiles(itemId);
+      const match  = assets.find(a => a.name.toLowerCase() === headerFilename.toLowerCase());
+      if (!match) {
+        console.warn(`Header image "${headerFilename}" not found in Files column for item ${itemId} — header left unchanged.`);
+        // Still apply HeaderLink to the existing image if provided
+        return headerLink ? replaceFirstImage(html, null, headerLink) : html;
+      }
+      const buf       = await downloadMondayAsset(match);
+      const publicUrl = await rehostToSharePoint(`header_${itemId}_${match.name}`, buf);
+      if (!publicUrl) return html;
+      console.log(`Header image re-hosted: ${publicUrl}`);
+      return replaceFirstImage(html, publicUrl, headerLink);
+    } else {
+      // HeaderLink only — wrap the existing <img> without touching its src
+      return replaceFirstImage(html, null, headerLink);
+    }
   } catch (err) {
     console.warn(`Header image swap skipped for ${itemId}: ${err.message}`);
     return html;
@@ -357,13 +383,13 @@ function parseButtons(html) {
 
 // Known structured variable prefixes — lines starting with these are parsed as variables.
 // Everything else is treated as freeform prompt and stored under __freeform__.
-const STRUCTURED_PREFIXES = ["PreheaderText", "PreheaderLink", "BodyText", "Button", "Link", "Color", "Style", "Article", "Title", "WhatsNew", "WhyItMatters"];
+const STRUCTURED_PREFIXES = ["PreheaderText", "PreheaderLink", "BodyText", "Button", "Link", "Color", "Style", "Article", "Title", "WhatsNew", "WhyItMatters", "HeaderImage", "HeaderLink"];
 
 function parseInstructions(instructions) {
   const vars = {};
   if (!instructions) return vars;
 
-  const VARIABLE_NAMES = ["PreheaderText", "PreheaderLink", "BodyText"];
+  const VARIABLE_NAMES = ["PreheaderText", "PreheaderLink", "BodyText", "HeaderImage", "HeaderLink"];
   const pattern = new RegExp(
     `(${VARIABLE_NAMES.join("|")})\\s*:\\s*"?([^"\\n]*(?:\\n(?!(?:${VARIABLE_NAMES.join("|")})\\s*:)[^\\n]*)*)"?`,
     "gi"
@@ -497,7 +523,7 @@ ${html}`,
   }
 
   if (ticket.id && ticket.id !== "manual") {
-    html = await applyHeaderImage(html, ticket.id);
+    html = await applyHeaderImage(html, ticket.id, vars);
   }
 
   return html;
