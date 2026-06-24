@@ -14,7 +14,7 @@
  * Required env vars:
  *   MONDAY_API_TOKEN, ANTHROPIC_API_KEY, BOARD_ID
  *   SHAREPOINT_TENANT_ID, SHAREPOINT_CLIENT_ID, SHAREPOINT_CLIENT_SECRET, SHAREPOINT_DRIVE_ID
- *   HEADER_UPLOAD_FOLDER_URL (or HEADER_UPLOAD_FOLDER_ID)
+ *   HEADER_UPLOAD_FOLDER_URL (share link to the headers_banners folder)
  */
 
 const express   = require("express");
@@ -245,29 +245,32 @@ async function downloadMondayAsset(asset) {
 // Header image re-hosting (SharePoint anonymous link)
 // ═════════════════════════════════════════════
 let cachedFolderId = null;
-async function getHeaderFolderId() {
-  if (cachedFolderId) return cachedFolderId;
-  if (process.env.HEADER_UPLOAD_FOLDER_ID) { cachedFolderId = process.env.HEADER_UPLOAD_FOLDER_ID; return cachedFolderId; }
+let cachedFolderDriveId = null;
+async function getHeaderFolder() {
+  if (cachedFolderId && cachedFolderDriveId) return { folderId: cachedFolderId, driveId: cachedFolderDriveId };
 
   const shareUrl = process.env.HEADER_UPLOAD_FOLDER_URL;
-  if (!shareUrl) throw new Error("No HEADER_UPLOAD_FOLDER_ID or HEADER_UPLOAD_FOLDER_URL set.");
+  if (!shareUrl) throw new Error("No HEADER_UPLOAD_FOLDER_URL set.");
   const b64 = Buffer.from(shareUrl).toString("base64").replace(/=+$/, "").replace(/\//g, "_").replace(/\+/g, "-");
   const shareId = "u!" + b64;
 
   const token = await getSharePointToken();
-  const res   = await fetch(`https://graph.microsoft.com/v1.0/shares/${shareId}/driveItem`, { headers: { Authorization: `Bearer ${token}` } });
+  // Expand parentReference so we get the folder's actual driveId — it may differ from SHAREPOINT_DRIVE_ID
+  const res   = await fetch(`https://graph.microsoft.com/v1.0/shares/${shareId}/driveItem?$select=id,name,parentReference`, { headers: { Authorization: `Bearer ${token}` } });
   if (!res.ok) throw new Error(`Folder resolve failed: ${res.status}`);
   const item = await res.json();
-  cachedFolderId = item.id;
-  console.log(`Resolved header upload folder ID: ${cachedFolderId}`);
-  return cachedFolderId;
+
+  cachedFolderId      = item.id;
+  cachedFolderDriveId = item.parentReference?.driveId || process.env.SHAREPOINT_DRIVE_ID;
+  console.log(`Resolved header upload folder: id=${cachedFolderId} drive=${cachedFolderDriveId}`);
+  return { folderId: cachedFolderId, driveId: cachedFolderDriveId };
 }
 
 async function rehostToSharePoint(fileName, buffer) {
-  const token  = await getSharePointToken();
-  const folder = await getHeaderFolderId();
+  const token = await getSharePointToken();
+  const { folderId, driveId } = await getHeaderFolder();
 
-  const uploadUrl = `https://graph.microsoft.com/v1.0/drives/${process.env.SHAREPOINT_DRIVE_ID}/items/${folder}:/${encodeURIComponent(fileName)}:/content`;
+  const uploadUrl = `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${folderId}:/${encodeURIComponent(fileName)}:/content`;
   const upRes = await fetch(uploadUrl, {
     method: "PUT",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/octet-stream" },
@@ -277,7 +280,7 @@ async function rehostToSharePoint(fileName, buffer) {
   const uploaded = await upRes.json();
 
   const linkRes = await fetch(
-    `https://graph.microsoft.com/v1.0/drives/${process.env.SHAREPOINT_DRIVE_ID}/items/${uploaded.id}/createLink`,
+    `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${uploaded.id}/createLink`,
     { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ type: "view", scope: "anonymous" }) }
   );
   if (!linkRes.ok) throw new Error(`Share link creation failed: ${linkRes.status}`);
@@ -669,7 +672,7 @@ async function persistAgentState(itemId, revision, history, currentHtml) {
 async function postUpdate(itemId, body, mentionIds = []) {
   const mentionsList = mentionIds.map(id => ({ id: parseInt(id, 10), type: "User" }));
   await mondayQuery(`
-    mutation PostUpdate($itemId: ID!, $body: String!, $mentionsList: [MentionType!]) {
+    mutation PostUpdate($itemId: ID!, $body: String!, $mentionsList: [UpdateMention]) {
       create_update(item_id: $itemId, body: $body, mentions_list: $mentionsList) { id }
     }
   `, { itemId, body, mentionsList: mentionsList.length ? mentionsList : undefined }, "2025-07");
