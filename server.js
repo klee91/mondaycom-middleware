@@ -39,7 +39,7 @@ const INSTRUCTIONS_COLUMN = "long_text_mm47njms"; // Instructions column
 const TEMPLATE_COLUMN = "dropdown_mm4d2e9v"; // Template dropdown column
 
 
-const CONTENT_VARIABLES = ["PreheaderText", "Subject"];
+const CONTENT_VARIABLES = ["PreheaderText", "Subject", "Partner"];
 
 const BUTTON_COLORS = {
   "purple": "#72246c", "light purple": "#86387f", "green": "#48a23f", "navy": "#0f206c",
@@ -345,7 +345,7 @@ function buildButton(text, url, colorName, style = "solid") {
 // Link/Color/Style are NOT top-level labels — they live inside BodyContent.
 // BodyText is kept as a backward-compatible alias for BodyContent.
 // Prompt: maps to __freeform__ (agent instructions).
-const CAPTURE_LABELS = ["PreheaderText", "PreheaderLink", "HeaderImage", "HeaderLink", "BodyContent", "BodyText", "Prompt"];
+const CAPTURE_LABELS = ["PreheaderText", "PreheaderLink", "HeaderImage", "HeaderLink", "Partner", "BodyContent", "BodyText", "Prompt"];
 // Back-compat alias
 const VARIABLE_NAMES = CAPTURE_LABELS;
 
