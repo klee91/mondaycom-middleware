@@ -498,6 +498,19 @@ async function resolveTemplateName(ticket) {
 }
 
 // ═════════════════════════════════════════════
+// Log token usage + prompt-cache activity for a Claude response.
+// cache_creation_input_tokens = tokens written to cache (first call, full price
+//   +25%); cache_read_input_tokens = tokens served from cache (~90% cheaper).
+// ═════════════════════════════════════════════
+function logUsage(label, message) {
+  const u = message?.usage || {};
+  console.log(
+    `[usage] ${label} — in:${u.input_tokens ?? "?"} out:${u.output_tokens ?? "?"} ` +
+    `cache_write:${u.cache_creation_input_tokens ?? 0} cache_read:${u.cache_read_input_tokens ?? 0}`
+  );
+}
+
+// ═════════════════════════════════════════════
 // Strip any prose preamble/postamble Claude may have added around the HTML.
 // Finds the first < and last > in the response and returns only that slice.
 // Falls back to the original if no valid HTML envelope is found.
@@ -534,8 +547,8 @@ async function generateHTML(ticket, templateName) {
   if (stillMissing.length > 0) {
     const message = await anthropic.messages.create({
       model: "claude-opus-4-6",
-      max_tokens: 8000,
-      system: AI_SYSTEM_PROMPT,
+      max_tokens: 16000,
+      system: [{ type: "text", text: AI_SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
       messages: [{
         role: "user",
         content: `The following placeholders still need content: ${stillMissing.join(", ")}
@@ -554,6 +567,7 @@ ${html}`,
       }],
     });
     const rawGenerated = message.content.find(b => b.type === "text")?.text ?? "";
+    logUsage(`generate "${ticket.name}"`, message);
     html = extractHtml(rawGenerated, html);
   }
 
@@ -578,8 +592,8 @@ async function reviseHTML(currentHtml, feedback, history, freeform = "") {
 
   const message = await anthropic.messages.create({
     model: "claude-opus-4-6",
-    max_tokens: 8000,
-    system: AI_SYSTEM_PROMPT,
+    max_tokens: 16000,
+    system: [{ type: "text", text: AI_SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
     messages: [{
       role: "user",
       content: `You previously generated this email proof. The requestor has reviewed it and given feedback. Apply ONLY the requested changes while keeping everything else intact and following all CPA.com brand standards.
@@ -596,6 +610,7 @@ ${currentHtml}`,
   });
 
   const rawRevised = message.content.find(b => b.type === "text")?.text ?? "";
+  logUsage("revise", message);
   let html = extractHtml(rawRevised, currentHtml);
   if (originalFooter && !hasFooter(html)) html = reattachFooter(html, originalFooter);
   return html;
