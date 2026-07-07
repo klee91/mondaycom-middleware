@@ -6,6 +6,7 @@
  *   - SharePoint template library (Graph client-credentials)
  *   - Instructions-column variable substitution + brand buttons
  *   - Header image re-hosting from Files column
+ *   - Word doc (.docx) in Files column → extracted as body source content
  *   - Footer + Pardot-tag protection, brand style enforcement
  *   - Stateful agent webhook: item created → proof; @agent feedback → revise;
  *     Status=Approved → silent finalize
@@ -21,6 +22,7 @@ const cors      = require("cors");
 const fetch     = require("node-fetch").default || require("node-fetch");
 const FormData  = require("form-data");
 const Anthropic = require("@anthropic-ai/sdk").default;
+const mammoth   = require("mammoth");
 const path      = require("path");
 
 const app = express();
@@ -249,6 +251,35 @@ async function downloadMondayAsset(asset) {
   const res = await fetch(src);
   if (!res.ok) throw new Error(`Asset download failed: ${res.status}`);
   return Buffer.from(await res.arrayBuffer());
+}
+
+// Find a Word document in the ticket's Files column and extract its content as
+// clean HTML (headings, bold, lists, links preserved). Returns { name, html }
+// or null if none is attached. Legacy binary .doc is not supported — .docx only.
+async function fetchWordDocContent(itemId) {
+  try {
+    const assets = await fetchTicketFiles(itemId);
+    const doc = assets.find(a => /\.docx?$/i.test(a.name || ""));
+    if (!doc) return null;
+
+    if (/\.doc$/i.test(doc.name)) {
+      console.warn(`Legacy .doc not supported ("${doc.name}") — ask the requestor to attach a .docx.`);
+      return null;
+    }
+
+    const buffer = await downloadMondayAsset(doc);
+    const result = await mammoth.convertToHtml({ buffer });
+    const html = (result.value || "").trim();
+    if (!html) {
+      console.warn(`Word doc "${doc.name}" produced no content.`);
+      return null;
+    }
+    console.log(`Extracted Word doc "${doc.name}" (${html.length} chars of HTML)`);
+    return { name: doc.name, html };
+  } catch (err) {
+    console.warn(`Word doc extraction failed for ${itemId}: ${err.message}`);
+    return null;
+  }
 }
 
 // Replace the first <img> src in the HTML, and optionally wrap it in an <a> tag.
@@ -544,6 +575,14 @@ async function generateHTML(ticket, templateName) {
   if (/BODY_CONTENT_HERE/.test(html) || /\{\{BodyContent\}\}/.test(html) || /\{\{BodyText\}\}/.test(html)) stillMissing.push("BodyContent");
   if (/\{\{PreheaderText\}\}/.test(html)) stillMissing.push("PreheaderText");
 
+  // If the body still needs content, check for an attached Word doc to use as
+  // source material. Instructions BodyContent takes precedence (it would have
+  // already filled the token above); the doc is the fallback content source.
+  let docContent = null;
+  if (stillMissing.includes("BodyContent") && ticket.id && ticket.id !== "manual") {
+    docContent = await fetchWordDocContent(ticket.id);
+  }
+
   if (stillMissing.length > 0) {
     const message = await anthropic.messages.create({
       model: "claude-opus-4-6",
@@ -561,7 +600,7 @@ Job Number: ${vars["JobNumber"]}
 Description: ${ticket.description || "No description provided."}
 Category: ${ticket.category || ""}
 Product: ${ticket.product || ""}
-${vars["__freeform__"] ? `\nAdditional instructions from the requestor (apply these when generating content):\n${vars["__freeform__"]}` : ""}
+${vars["__freeform__"] ? `\nAdditional instructions from the requestor (apply these when generating content):\n${vars["__freeform__"]}` : ""}${docContent ? `\nSOURCE CONTENT (from the attached Word document "${docContent.name}"). Use this as the basis for the email body. Rewrite/reformat it into brand-compliant, table-based email HTML for the BODY_CONTENT_HERE region — preserve its meaning, structure, headings, and links, but apply CPA.com styling. Do not copy any Word styling verbatim:\n${docContent.html}\n` : ""}
 HTML TEMPLATE (partially populated — only fill the remaining placeholders listed above):
 ${html}`,
       }],
