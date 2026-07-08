@@ -870,9 +870,12 @@ app.post("/api/webhook", async (req, res) => {
         ticket = await fetchItemById(itemId);
       }
 
-      // Guardrail: only generate when the Instructions column has content
-      if (!ticket.instructions || !ticket.instructions.trim()) {
-        console.log(`[agent] Item ${itemId} has no Instructions — skipping generation`);
+      // Guardrail: generate when there's Instructions content OR an attached
+      // Word doc to use as body source. Skip only when there's neither.
+      const hasInstructions = !!(ticket.instructions && ticket.instructions.trim());
+      const hasDoc = await fetchWordDocContent(itemId);
+      if (!hasInstructions && !hasDoc) {
+        console.log(`[agent] Item ${itemId} has no Instructions and no Word doc — skipping generation`);
         return;
       }
 
@@ -920,8 +923,29 @@ app.post("/api/webhook", async (req, res) => {
 
       const meta     = await readAgentMeta(itemId);
       const baseHtml = await readCurrentHtml(itemId, meta);
+
+      // No prior draft yet — treat this as a request to generate the FIRST proof
+      // (covers the case where the item was created without Instructions/doc, or
+      // creation didn't trigger, and the requestor now tags @agent to kick it off).
       if (!baseHtml) {
-        await postUpdate(itemId, `<p>I don't have a prior draft stored for this item yet. If the first proof was just generated, give it a moment and try again.</p>`);
+        console.log(`[agent] No prior draft on ${itemId} — generating first proof from @agent request`);
+        const templateName = await resolveTemplateName(ticket);
+        const html         = await generateHTML(ticket, templateName);
+        const fileName     = `${ticket.name.replace(/\s+/g, "_")}_${ticket.jobNumber || itemId}_v1.html`;
+
+        await uploadToMonday(itemId, fileName, html);
+        await persistAgentState(itemId, 1, [], html);
+
+        const reqId    = await findUserIdByName(ticket.requestor);
+        const reqName  = ticket.requestor.split(",")[0].trim();
+        const reqTag   = reqId ? `<strong>@${reqName}</strong> ` : "";
+        await postUpdate(itemId,
+          `<p>${reqTag}Your email proof (v1) is ready and attached to this item's Files. ` +
+          `Review it and reply with <strong>@agent</strong> followed by any changes you'd like. ` +
+          `When it's ready, set Status to <strong>Approved</strong>.</p>`,
+          reqId ? [reqId] : []
+        );
+        console.log(`[agent] Item ${itemId} v1 complete (via @agent)`);
         return;
       }
 
