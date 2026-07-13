@@ -118,7 +118,7 @@ function fileNameToDisplayName(filename) {
 }
 
 // Fetch (and cache) the folder listing → { displayName: itemId }
-async function fetchTemplateIndex() {
+async function fetchTemplateIndex({ includeNonHtml = false } = {}) {
   if (templateIndexCache && Date.now() - templateIndexCache.fetchedAt < CACHE_TTL_MS) {
     return templateIndexCache.map;
   }
@@ -129,6 +129,11 @@ async function fetchTemplateIndex() {
   const data = await res.json();
   const map  = {};
   for (const item of (data.value || [])) {
+    if (includeNonHtml) {
+       map[item.name] = item.id;          // raw filename, not display-cased
+    } else if (/\.html$/i.test(item.name)) {
+       map[fileNameToDisplayName(item.name)] = item.id;
+    }
     if (/\.html$/i.test(item.name)) map[fileNameToDisplayName(item.name)] = item.id;
   }
   templateIndexCache = { map, fetchedAt: Date.now() };
@@ -167,6 +172,224 @@ async function fetchTemplateFromSharePoint(templateName) {
   console.log(`Fetched template "${templateName}" from SharePoint (${html.length} bytes)`);
   return html;
 }
+
+/**
+ * template-retrieval.js
+ * ---------------------------------------------------------------------------
+ * RAG few-shot template retrieval layer.
+ * ---------------------------------------------------------------------------
+ */
+
+let manifestCache   = null; // { data, fetchedAt }
+let brandGuideCache = null; // { data, fetchedAt }
+
+// ---------------------------------------------------------------------------
+// Fetch manifest.json / brand-guide.json from the SharePoint drive root.
+// Reuses fetchTemplateIndex()'s resolved item map so we don't hit Graph twice
+// for the folder listing.
+// ---------------------------------------------------------------------------
+async function fetchDriveJsonFile(filename) {
+  const index = await fetchTemplateIndex({ includeNonHtml: true }); // see note below
+  const itemId = index[filename];
+  if (!itemId) {
+    throw new Error(`"${filename}" not found at SharePoint drive root.`);
+  }
+  const token = await getSharePointToken();
+  const metaRes = await fetch(
+    `https://graph.microsoft.com/v1.0/drives/${process.env.SHAREPOINT_DRIVE_ID}/items/${itemId}?select=id,name,@microsoft.graph.downloadUrl`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  if (!metaRes.ok) throw new Error(`${filename} metadata fetch failed: ${metaRes.status}`);
+  const meta = await metaRes.json();
+  const downloadUrl = meta["@microsoft.graph.downloadUrl"];
+  if (!downloadUrl) throw new Error(`No download URL for ${filename}`);
+  const fileRes = await fetch(downloadUrl);
+  if (!fileRes.ok) throw new Error(`${filename} download failed: ${fileRes.status}`);
+  return JSON.parse(await fileRes.text());
+}
+
+async function getManifest() {
+  if (manifestCache && Date.now() - manifestCache.fetchedAt < CACHE_TTL_MS) {
+    return manifestCache.data;
+  }
+  const data = await fetchDriveJsonFile("manifest.json");
+  manifestCache = { data, fetchedAt: Date.now() };
+  console.log(`Template manifest refreshed: ${data.templates.length} entries`);
+  return data;
+}
+
+async function getBrandGuide() {
+  if (brandGuideCache && Date.now() - brandGuideCache.fetchedAt < CACHE_TTL_MS) {
+    return brandGuideCache.data;
+  }
+  const data = await fetchDriveJsonFile("brand-guide.json");
+  brandGuideCache = { data, fetchedAt: Date.now() };
+  console.log("Brand guide refreshed");
+  return data;
+}
+
+// ---------------------------------------------------------------------------
+// Tier 1: cheap keyword/tag overlap scoring. No API call.
+// ---------------------------------------------------------------------------
+function scoreTemplateAgainstText(template, text) {
+  const haystack = text.toLowerCase();
+  let score = 0;
+  for (const tag of template.tags) {
+    if (haystack.includes(tag.toLowerCase())) score += 3;
+  }
+  // loose token overlap as a secondary signal
+  const tagTokens = new Set(
+    template.tags.join(" ").toLowerCase().split(/\W+/).filter(w => w.length > 3)
+  );
+  for (const tok of tagTokens) {
+    if (haystack.includes(tok)) score += 1;
+  }
+  return score;
+}
+
+function classifyByKeyword(manifest, ticketText) {
+  const scored = manifest.templates
+    .map(t => ({ template: t, score: scoreTemplateAgainstText(t, ticketText) }))
+    .filter(s => s.score > 0)
+    .sort((a, b) => b.score - a.score);
+
+  if (scored.length === 0) return { confident: false, matches: [] };
+
+  const topScore = scored[0].score;
+  const runnerUpScore = scored[1]?.score ?? 0;
+  // "confident" = clear leader, comfortably above zero
+  const confident = topScore >= 4 && topScore - runnerUpScore >= 2;
+
+  return { confident, matches: scored.slice(0, 3).map(s => s.template) };
+}
+
+// ---------------------------------------------------------------------------
+// Tier 2: cheap Haiku call, only invoked when Tier 1 is ambiguous.
+// Structured JSON output, minimal tokens (tag list only, not full templates).
+// ---------------------------------------------------------------------------
+async function classifyWithModel(manifest, ticketText) {
+  const tagVocab = [...new Set(manifest.templates.flatMap(t => t.tags))];
+
+  const response = await anthropic.messages.create({
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 300,
+    system:
+      "You classify marketing email tickets against a fixed list of template IDs. " +
+      "Respond ONLY with JSON: {\"templateIds\": [\"id1\", \"id2\"]} — 1 to 3 ids, " +
+      "most relevant first. Prefer reusing the given tag vocabulary in your reasoning; " +
+      "do not invent template ids that aren't in the list below.",
+    messages: [
+      {
+        role: "user",
+        content:
+          `Ticket text:\n${ticketText}\n\n` +
+          `Available templates:\n${manifest.templates
+            .map(t => `- ${t.id}: ${t.useCase} (tags: ${t.tags.join(", ")})`)
+            .join("\n")}\n\n` +
+          `Known tag vocabulary: ${tagVocab.join(", ")}`,
+      },
+    ],
+  });
+
+  const text = response.content.find(b => b.type === "text")?.text ?? "{}";
+  let parsed;
+  try {
+    parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
+  } catch {
+    return [];
+  }
+  const ids = new Set(parsed.templateIds || []);
+  return manifest.templates.filter(t => ids.has(t.id));
+}
+
+// ---------------------------------------------------------------------------
+// Public entry point: classify a ticket, return 1-3 template manifest entries.
+// ---------------------------------------------------------------------------
+async function selectRelevantTemplates(ticket) {
+  const manifest = await getManifest();
+  const ticketText = [
+    ticket.description,
+    ticket.subjectLine,
+    ticket.templateDropdownValue,
+    ticket.groupName,
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const tier1 = classifyByKeyword(manifest, ticketText);
+  if (tier1.confident) {
+    console.log(`Template classification (keyword, confident): ${tier1.matches.map(t => t.id).join(", ")}`);
+    return tier1.matches;
+  }
+
+  console.log("Template classification: keyword match ambiguous, falling back to model.");
+  const modelMatches = await classifyWithModel(manifest, ticketText);
+  if (modelMatches.length > 0) return modelMatches;
+
+  // last resort: fall back to keyword matches even if not "confident",
+  // or empty (caller should fall back to the default General archetype)
+  return tier1.matches;
+}
+
+// ---------------------------------------------------------------------------
+// Strip the footer out of a few-shot HTML example (server reattaches the real
+// footer post-generation anyway — see brand-guide.footer.serverSideReattachment).
+// Keeps few-shot examples short and avoids ever putting real footer content
+// into a "here's a style example" context by mistake.
+// ---------------------------------------------------------------------------
+function stripFooterForFewShot(html) {
+  return html.replace(/<!--\s*START FOOTER\s*-->[\s\S]*?<!--\s*END FOOTER\s*-->/i, "<!-- FOOTER OMITTED: server reattaches actual footer verbatim -->");
+}
+
+// ---------------------------------------------------------------------------
+// Build the system prompt: static rules + brand guide (cacheable prefix)
+// + up to 3 footer-stripped few-shot examples (per-ticket, not cached).
+// ---------------------------------------------------------------------------
+async function buildSystemPromptWithRAG({ staticBrandRules, ticket }) {
+  const brandGuide = await getBrandGuide();
+  const selected = await selectRelevantTemplates(ticket);
+
+  const fewShotBlocks = await Promise.all(
+    selected.map(async t => {
+      const html = await fetchTemplateFromSharePoint(t.filename.replace(/\.html$/i, ""));
+      return (
+        `### Example: ${t.useCase}\n` +
+        `Tags: ${t.tags.join(", ")}\n` +
+        `Tone notes: ${t.toneNotes}\n` +
+        `CTA pattern: ${t.ctaPattern}\n\n` +
+        "```html\n" + stripFooterForFewShot(html) + "\n```"
+      );
+    })
+  );
+
+  return [
+    {
+      type: "text",
+      text: staticBrandRules,
+    },
+    {
+      type: "text",
+      text: "BRAND GUIDE (structured):\n" + JSON.stringify(brandGuide, null, 2),
+      cache_control: { type: "ephemeral" }, // stable prefix ends here
+    },
+    {
+      type: "text",
+      text:
+        selected.length > 0
+          ? "RELEVANT TEMPLATE EXAMPLES (retrieved for this ticket, footers omitted — do not reproduce footer content from these):\n\n" +
+            fewShotBlocks.join("\n\n---\n\n")
+          : "No closely-matching prior template found — use the General archetype as the default fallback.",
+    },
+  ];
+}
+
+module.exports = {
+  getManifest,
+  getBrandGuide,
+  selectRelevantTemplates,
+  buildSystemPromptWithRAG,
+  stripFooterForFewShot,
+};
 
 // ═════════════════════════════════════════════
 // Monday GraphQL helper
