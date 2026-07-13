@@ -1,0 +1,79 @@
+{
+    "version": 1,
+    "updated": "2026-07-13",
+    "templates": [
+      {
+        "id": "aicpa-town-hall-newsletter",
+        "filename": "AICPA_TOWN_HALL_NEWSLETTER_TEMPLATE.html",
+        "archetype": "newsletter",
+        "tags": ["AICPA Town Hall", "newsletter", "multi-topic roundup", "video highlights"],
+        "useCase": "Recurring AICPA Town Hall recap newsletter — repeating video-highlight blocks (320x181 image + bold title + description), each linking out to a timestamped recording.",
+        "toneNotes": "Short, punchy block descriptions. No long paragraphs per block — treat each block like a highlight reel entry, not an article.",
+        "ctaPattern": "Bold purple pre-header CTA at the very top; each content block's image/title is itself the link (no separate button per block).",
+        "addedDate": "2026-07-13",
+        "autoTagged": false,
+        "curatedBy": "Kevin"
+      },
+      {
+        "id": "ai-in-focus-newsletter",
+        "filename": "AI_IN_FOCUS_NEWSLETTER.html",
+        "archetype": "newsletter",
+        "tags": ["AI in Focus", "newsletter", "multi-topic roundup", "AI news"],
+        "useCase": "Recurring AI-focused news roundup — 4 numbered article modules, each with a 'What's new:' / 'Why it matters:' two-part structure.",
+        "toneNotes": "Denser and more analytical than AICPA Town Hall — full paragraphs per section, font-weight 400 (not the usual 300), navy (#0f206c) bold section headers.",
+        "ctaPattern": "Pre-built bracket-style 'Read more →' button per article (cyan #41b6e6, left/right PNG brackets) — this is protected template structure, not the standard Button:/Link: system. Only href/text may be swapped, and only when explicitly instructed.",
+        "addedDate": "2026-07-13",
+        "autoTagged": false,
+        "curatedBy": "Kevin"
+      },
+      {
+        "id": "cpacom-general",
+        "filename": "CPACOM_GENERAL_TEMPLATE.html",
+        "archetype": "general",
+        "tags": ["CPA.com general", "single message", "default fallback"],
+        "useCase": "Default single-message email for CPA.com-branded sends — plain header image, intro + body paragraph(s), no promo styling. Use when nothing else fits.",
+        "toneNotes": "Plain, professional, no special emphasis styling beyond standard body/bold/link rules.",
+        "ctaPattern": "Standard Button:/Link: system CTA (solid purple default) — no pre-built buttons in this template.",
+        "addedDate": "2026-07-13",
+        "autoTagged": false,
+        "curatedBy": "Kevin"
+      },
+      {
+        "id": "dotcpa-general",
+        "filename": "DOTCPA_GENERAL_TEMPLATE.html",
+        "archetype": "general",
+        "tags": ["Domains.CPA", "DOTCPA", "single message", "sub-brand"],
+        "useCase": "Default single-message email for the Domains.CPA sub-brand — same skeleton as CPA.com General, but with 'Domains.CPA' wordmark in the footer bar instead of 'CPA.com/'.",
+        "toneNotes": "Same as CPA.com General — plain, professional, no promo styling.",
+        "ctaPattern": "Standard Button:/Link: system CTA — no pre-built buttons in this template.",
+        "addedDate": "2026-07-13",
+        "autoTagged": false,
+        "curatedBy": "Kevin",
+        "note": "Lacks section marker comments entirely (no START/END FOOTER, no PREHEADER/HEADER) — footer detection should fall back to the 'Black Footer Bar' markers for this template. See brand-guide.json sectionMarkers.knownGaps."
+      },
+      {
+        "id": "cpa-partner-single",
+        "filename": "CPA_PARTNER_(SINGLE).html",
+        "archetype": "partnerCoBranded",
+        "tags": ["partner co-branded", "single partner logo", "webinar promotion", "workshop promotion"],
+        "useCase": "Co-branded email featuring one external partner logo alongside CPA.com's — commonly used for partner webinar/workshop promotion.",
+        "toneNotes": "Same body copy rules as General, plus mentions the partner by name in the intro when relevant.",
+        "ctaPattern": "Standard Button:/Link: system CTA; footer wordmark link uses '{{Partner}}' merge token (e.g. 'CPA.com/{{Partner}}').",
+        "addedDate": "2026-07-13",
+        "autoTagged": false,
+        "curatedBy": "Kevin"
+      },
+      {
+        "id": "cpa-partner-double",
+        "filename": "CPA_PARTNER_(DOUBLE).html",
+        "archetype": "partnerCoBranded",
+        "tags": ["partner co-branded", "double partner logo", "two partners", "webinar promotion", "workshop promotion"],
+        "useCase": "Co-branded email featuring two external partner logos alongside CPA.com's — used when a send involves two partners at once (e.g. a joint webinar).",
+        "toneNotes": "Same as CPA Partner Single, adapted for two partners in the same send.",
+        "ctaPattern": "Standard Button:/Link: system CTA; footer wordmark link uses '{{Partner}}' merge token.",
+        "addedDate": "2026-07-13",
+        "autoTagged": false,
+        "curatedBy": "Kevin"
+      }
+    ]
+  }

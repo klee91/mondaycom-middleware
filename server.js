@@ -177,55 +177,291 @@ async function fetchTemplateFromSharePoint(templateName) {
  * template-retrieval.js
  * ---------------------------------------------------------------------------
  * RAG few-shot template retrieval layer.
+ * Drop these functions into server.js alongside fetchTemplateIndex() /
+ * fetchTemplateFromSharePoint() — those stay unchanged, templates HTML keeps
+ * living in SharePoint, read-only, exactly as today.
+ *
+ * SOURCE OF TRUTH for *which templates exist* = the SharePoint folder listing
+ * itself (fetchTemplateIndex()). manifest.json is an auto-maintained tag
+ * cache, not hand-authored — new .html files in the folder get auto-tagged
+ * the next time the manifest loads.
+ *
+ * manifest.json AND brand-guide.json are hosted on GitHub, not SharePoint —
+ * SharePoint write scope (Files.ReadWrite.All) wasn't available, and a
+ * fine-grained GitHub PAT scoped to just this repo's Contents is much easier
+ * to provision than a Graph admin-consent flow. Bonus: every manifest update
+ * becomes a git commit, so you get tag-change history for free.
+ *
+ * New env vars:
+ *   GITHUB_TOKEN             - fine-grained PAT, Contents: Read & Write on the repo below
+ *   GITHUB_OWNER             - e.g. "cpa-com"
+ *   GITHUB_REPO              - e.g. "email-agent-data"
+ *   GITHUB_BRANCH            - default "main"
+ *   GITHUB_MANIFEST_PATH     - e.g. "manifest.json"
+ *   GITHUB_BRAND_GUIDE_PATH  - e.g. "brand-guide.json"
  * ---------------------------------------------------------------------------
  */
 
-let manifestCache   = null; // { data, fetchedAt }
+const CACHE_TTL_MS = 10 * 60 * 1000; // matches existing pattern
+
+let manifestCache   = null; // { data, fetchedAt, sha }
 let brandGuideCache = null; // { data, fetchedAt }
 
+const GITHUB_API = "https://api.github.com";
+const GH_OWNER  = process.env.GITHUB_OWNER;
+const GH_REPO   = process.env.GITHUB_REPO;
+const GH_BRANCH = process.env.GITHUB_BRANCH || "main";
+
 // ---------------------------------------------------------------------------
-// Fetch manifest.json / brand-guide.json from the SharePoint drive root.
-// Reuses fetchTemplateIndex()'s resolved item map so we don't hit Graph twice
-// for the folder listing.
+// GitHub Contents API helpers
 // ---------------------------------------------------------------------------
-async function fetchDriveJsonFile(filename) {
-  const index = await fetchTemplateIndex({ includeNonHtml: true }); // see note below
-  const itemId = index[filename];
-  if (!itemId) {
-    throw new Error(`"${filename}" not found at SharePoint drive root.`);
-  }
-  const token = await getSharePointToken();
-  const metaRes = await fetch(
-    `https://graph.microsoft.com/v1.0/drives/${process.env.SHAREPOINT_DRIVE_ID}/items/${itemId}?select=id,name,@microsoft.graph.downloadUrl`,
-    { headers: { Authorization: `Bearer ${token}` } }
+async function githubGetFile(path) {
+  const res = await fetch(
+    `${GITHUB_API}/repos/${GH_OWNER}/${GH_REPO}/contents/${encodeURIComponent(path)}?ref=${GH_BRANCH}`,
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+        Accept: "application/vnd.github+json",
+      },
+    }
   );
-  if (!metaRes.ok) throw new Error(`${filename} metadata fetch failed: ${metaRes.status}`);
-  const meta = await metaRes.json();
-  const downloadUrl = meta["@microsoft.graph.downloadUrl"];
-  if (!downloadUrl) throw new Error(`No download URL for ${filename}`);
-  const fileRes = await fetch(downloadUrl);
-  if (!fileRes.ok) throw new Error(`${filename} download failed: ${fileRes.status}`);
-  return JSON.parse(await fileRes.text());
+  if (res.status === 404) return null; // file doesn't exist yet
+  if (!res.ok) throw new Error(`GitHub read failed for ${path}: ${res.status} ${res.statusText}`);
+  const json = await res.json();
+  const content = Buffer.from(json.content, "base64").toString("utf-8");
+  return { content: JSON.parse(content), sha: json.sha };
 }
+
+async function githubPutFile(path, data, message, knownSha = null) {
+  const sha = knownSha ?? (await githubGetFile(path))?.sha ?? null;
+
+  const res = await fetch(
+    `${GITHUB_API}/repos/${GH_OWNER}/${GH_REPO}/contents/${encodeURIComponent(path)}`,
+    {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+        Accept: "application/vnd.github+json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        message,
+        content: Buffer.from(JSON.stringify(data, null, 2)).toString("base64"),
+        branch: GH_BRANCH,
+        ...(sha ? { sha } : {}), // omit sha on first-ever create
+      }),
+    }
+  );
+
+  if (res.status === 409 || res.status === 422) {
+    // stale sha (concurrent write) — refetch and retry once
+    console.warn(`GitHub write conflict on ${path}, refetching sha and retrying once.`);
+    const fresh = await githubGetFile(path);
+    return githubPutFileRetry(path, data, message, fresh?.sha ?? null);
+  }
+  if (!res.ok) throw new Error(`GitHub write failed for ${path}: ${res.status} ${res.statusText}`);
+  const json = await res.json();
+  return json.content.sha;
+}
+
+async function githubPutFileRetry(path, data, message, sha) {
+  const res = await fetch(
+    `${GITHUB_API}/repos/${GH_OWNER}/${GH_REPO}/contents/${encodeURIComponent(path)}`,
+    {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+        Accept: "application/vnd.github+json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        message,
+        content: Buffer.from(JSON.stringify(data, null, 2)).toString("base64"),
+        branch: GH_BRANCH,
+        ...(sha ? { sha } : {}),
+      }),
+    }
+  );
+  if (!res.ok) throw new Error(`GitHub write retry failed for ${path}: ${res.status} ${res.statusText}`);
+  const json = await res.json();
+  return json.content.sha;
+}
+
+/**
+ * NOTE on fetchTemplateIndex(): your current implementation filters to
+ * `.html` only. Add an `{ includeNonHtml }` option so this module can resolve
+ * raw filenames (needed by ensureManifestUpToDate() below to detect new
+ * templates dropped in the folder) through the same cached index rather than
+ * writing a second Graph listing call:
+ *
+ *   async function fetchTemplateIndex({ includeNonHtml = false } = {}) {
+ *     ...
+ *     for (const item of (data.value || [])) {
+ *       if (includeNonHtml) {
+ *         map[item.name] = item.id;          // raw filename, not display-cased
+ *       } else if (/\.html$/i.test(item.name)) {
+ *         map[fileNameToDisplayName(item.name)] = item.id;
+ *       }
+ *     }
+ *     ...
+ *   }
+ *
+ * (Two different key styles — display-cased for html templates, raw filename
+ * for the new-file diff — so both existing and new callers keep working
+ * unmodified. Note: manifest.json/brand-guide.json no longer live in
+ * SharePoint at all now, so this option is only needed for detecting new
+ * .html templates, not for locating JSON files.)
+ */
 
 async function getManifest() {
   if (manifestCache && Date.now() - manifestCache.fetchedAt < CACHE_TTL_MS) {
     return manifestCache.data;
   }
-  const data = await fetchDriveJsonFile("manifest.json");
+  const path = process.env.GITHUB_MANIFEST_PATH || "manifest.json";
+  const remote = await githubGetFile(path); // null if not created yet
+  let data = remote?.content ?? { version: 0, updated: null, templates: [] };
+  if (!remote) console.log("No manifest.json in GitHub repo yet — starting from empty manifest.");
+
+  data = await ensureManifestUpToDate(data);
   manifestCache = { data, fetchedAt: Date.now() };
   console.log(`Template manifest refreshed: ${data.templates.length} entries`);
   return data;
+}
+
+// ---------------------------------------------------------------------------
+// Diff the manifest against the live SharePoint folder listing (still the
+// real source of truth for *which templates exist*). Any .html file present
+// in the folder but not yet in the manifest gets auto-tagged with one cheap
+// Haiku call, then the manifest is committed to GitHub so this only happens
+// once per new template.
+// ---------------------------------------------------------------------------
+async function ensureManifestUpToDate(manifest) {
+  const liveIndex = await fetchTemplateIndex({ includeNonHtml: false }); // { displayName: itemId }
+  const knownFilenames = new Set(manifest.templates.map(t => t.filename));
+
+  // liveIndex keys are display-cased names; we need the raw filenames too —
+  // fetchTemplateIndex({ includeNonHtml: true }) gives raw filenames, reuse that.
+  const rawIndex = await fetchTemplateIndex({ includeNonHtml: true });
+  const newFilenames = Object.keys(rawIndex).filter(
+    name => /\.html$/i.test(name) && !knownFilenames.has(name)
+  );
+
+  if (newFilenames.length === 0) return manifest;
+
+  console.log(`Found ${newFilenames.length} untagged template(s): ${newFilenames.join(", ")}`);
+
+  const newEntries = [];
+  for (const filename of newFilenames) {
+    try {
+      const html = await fetchTemplateFromSharePoint(filename.replace(/\.html$/i, ""));
+      const entry = await autoTagTemplate(filename, html, manifest.templates);
+      newEntries.push(entry);
+    } catch (err) {
+      console.error(`Auto-tagging failed for ${filename}: ${err.message}`);
+    }
+  }
+
+  if (newEntries.length === 0) return manifest;
+
+  const updated = {
+    version: (manifest.version || 0) + 1,
+    updated: new Date().toISOString(),
+    templates: [...manifest.templates, ...newEntries],
+  };
+
+  await writeManifestToGithub(updated); // commits the update to the GitHub repo
+  return updated;
+}
+
+// ---------------------------------------------------------------------------
+// One cheap Haiku call per new template: infer tags/useCase/archetype/tone
+// from the HTML itself. Fed the existing tag vocabulary so it reuses tags
+// instead of fragmenting ("CAS workshop" vs "CAS Workshop Promo" etc).
+// ---------------------------------------------------------------------------
+async function autoTagTemplate(filename, html, existingTemplates) {
+  const tagVocab = [...new Set(existingTemplates.flatMap(t => t.tags))];
+
+  const response = await anthropic.messages.create({
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 400,
+    system:
+      "You tag marketing email HTML templates for a retrieval library. " +
+      "Respond ONLY with JSON matching this shape: " +
+      '{"tags": ["..."], "useCase": "...", "archetype": "newsletter|general", ' +
+      '"toneNotes": "...", "ctaPattern": "..."}. ' +
+      "Prefer reusing tags from the existing vocabulary given below when they fit; " +
+      "only add a new tag if nothing existing captures it. Keep useCase, toneNotes, " +
+      "and ctaPattern each to one concise sentence.",
+    messages: [
+      {
+        role: "user",
+        content:
+          `Filename: ${filename}\n\n` +
+          `Existing tag vocabulary: ${tagVocab.join(", ") || "(none yet)"}\n\n` +
+          `Template HTML:\n${html.slice(0, 12000)}`, // cap to keep the call cheap
+      },
+    ],
+  });
+
+  const text = response.content.find(b => b.type === "text")?.text ?? "{}";
+  let parsed;
+  try {
+    parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
+  } catch {
+    parsed = {};
+  }
+
+  return {
+    id: filename.replace(/\.html$/i, "").toLowerCase().replace(/[^a-z0-9]+/g, "-"),
+    filename,
+    archetype: parsed.archetype || "general",
+    tags: parsed.tags || [],
+    useCase: parsed.useCase || "",
+    toneNotes: parsed.toneNotes || "",
+    ctaPattern: parsed.ctaPattern || "",
+    addedDate: new Date().toISOString().slice(0, 10),
+    autoTagged: true,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Requires GITHUB_TOKEN with Contents: Read & Write on GITHUB_OWNER/GITHUB_REPO. Degrades
+// gracefully — logs once and keeps working from the in-memory cache if the
+// token/repo isn't configured yet, just re-tags on every cache expiry
+// instead of persisting.
+// ---------------------------------------------------------------------------
+let githubWriteSupported = true;
+
+async function writeManifestToGithub(manifest) {
+  if (!githubWriteSupported) return;
+  const path = process.env.GITHUB_MANIFEST_PATH || "manifest.json";
+  try {
+    await githubPutFile(
+      path,
+      manifest,
+      `auto-tag: ${manifest.templates.length} templates (v${manifest.version})`
+    );
+    console.log("manifest.json committed to GitHub.");
+  } catch (err) {
+    githubWriteSupported = false;
+    console.warn(
+      `manifest.json commit to GitHub failed: ${err.message} — check GITHUB_TOKEN scope ` +
+      `and GITHUB_OWNER/GITHUB_REPO. Auto-tagging will still run each cache cycle, it just ` +
+      `won't persist between runs until this is fixed.`
+    );
+  }
 }
 
 async function getBrandGuide() {
   if (brandGuideCache && Date.now() - brandGuideCache.fetchedAt < CACHE_TTL_MS) {
     return brandGuideCache.data;
   }
-  const data = await fetchDriveJsonFile("brand-guide.json");
-  brandGuideCache = { data, fetchedAt: Date.now() };
-  console.log("Brand guide refreshed");
-  return data;
+  const path = process.env.GITHUB_BRAND_GUIDE_PATH || "brand-guide.json";
+  const remote = await githubGetFile(path);
+  if (!remote) throw new Error(`brand-guide.json not found in GitHub repo at path "${path}".`);
+  brandGuideCache = { data: remote.content, fetchedAt: Date.now() };
+  console.log("Brand guide refreshed from GitHub.");
+  return remote.content;
 }
 
 // ---------------------------------------------------------------------------
@@ -389,6 +625,8 @@ module.exports = {
   selectRelevantTemplates,
   buildSystemPromptWithRAG,
   stripFooterForFewShot,
+  ensureManifestUpToDate,
+  autoTagTemplate,
 };
 
 // ═════════════════════════════════════════════
