@@ -1302,7 +1302,7 @@ app.post("/api/webhook", async (req, res) => {
   if (!event) return res.json({ status: "ignored" });
 
   res.json({ status: "received" });
-
+  console.log(`[agent] event=${event.type} pulseId=${event.pulseId} boardId=${event.boardId}`);
   try {
     // ── Trigger 1: item created → first proof ──
     if (event.type === "create_pulse") {
