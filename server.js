@@ -134,7 +134,7 @@ async function fetchTemplateIndex({ includeNonHtml = false } = {}) {
     } else if (/\.html$/i.test(item.name)) {
        map[fileNameToDisplayName(item.name)] = item.id;
     }
-    if (/\.html$/i.test(item.name)) map[fileNameToDisplayName(item.name)] = item.id;
+    // if (/\.html$/i.test(item.name)) map[fileNameToDisplayName(item.name)] = item.id;
   }
   templateIndexCache = { map, fetchedAt: Date.now() };
   console.log(`Template index refreshed: ${Object.keys(map).join(", ")}`);
@@ -201,8 +201,6 @@ async function fetchTemplateFromSharePoint(templateName) {
  *   GITHUB_BRAND_GUIDE_PATH  - e.g. "brand-guide.json"
  * ---------------------------------------------------------------------------
  */
-
-const CACHE_TTL_MS = 10 * 60 * 1000; // matches existing pattern
 
 let manifestCache   = null; // { data, fetchedAt, sha }
 let brandGuideCache = null; // { data, fetchedAt }
@@ -618,16 +616,6 @@ async function buildSystemPromptWithRAG({ staticBrandRules, ticket }) {
     },
   ];
 }
-
-module.exports = {
-  getManifest,
-  getBrandGuide,
-  selectRelevantTemplates,
-  buildSystemPromptWithRAG,
-  stripFooterForFewShot,
-  ensureManifestUpToDate,
-  autoTagTemplate,
-};
 
 // ═════════════════════════════════════════════
 // Monday GraphQL helper
