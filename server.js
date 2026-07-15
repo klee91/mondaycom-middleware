@@ -174,7 +174,395 @@ async function fetchTemplateFromSharePoint(templateName) {
 }
 
 /**
- * template-retrieval.js
+ * ---------------------------------------------------------------------------
+ *
+ * Protected-block extract/restore.
+ *   Generalizes your existing extractFooter()/reattachFooter() pattern to an
+ *   ARRAY of fragile regions. Before the template goes to Claude, fragile
+ *   markup (AI-in-Focus bracket buttons, per-article PNG header-strip images,
+ *   the footer) is lifted out and replaced with opaque tokens the model can
+ *   move but not mangle. After generation, the real markup is restored
+ *   verbatim, then per-article numbering is stamped on deterministically.
+ *
+ * Structured-content-with-model-placement generation.
+ *   The model receives (a) the source content loosely (doc/BodyContent), and
+ *   (b) ONE canonical article block from the template as the structural
+ *   contract. Its job: emit N blocks matching that structure, choosing how
+ *   many and what to emphasize. Structure is constrained; editorial judgment
+ *   is the model's. That judgment is what improves with testing/training.
+ *
+ * ---------------------------------------------------------------------------
+ */
+
+// Which archetypes/templates use the repeating-block generation path.
+// Everything else keeps flowing through the existing placeholder-fill path.
+const DESIGN_TEMPLATES = {
+  "AI IN FOCUS Newsletter": "aiInFocus",
+  "AICPA Town Hall Newsletter": "aicpaTownHall",
+};
+
+function isDesignTemplate(templateName) {
+  const key = (templateName || "").trim().toLowerCase();
+  return Object.keys(DESIGN_TEMPLATES).some(k => k.toLowerCase() === key);
+}
+
+function designVariant(templateName) {
+  const key = (templateName || "").trim().toLowerCase();
+  const match = Object.keys(DESIGN_TEMPLATES).find(k => k.toLowerCase() === key);
+  return match ? DESIGN_TEMPLATES[match] : null;
+}
+
+// ═════════════════════════════════════════════
+// Protected-block extraction / restoration
+// ═════════════════════════════════════════════
+//
+// Each rule matches a fragile region by regex. Order among rules is
+// irrelevant to correctness (each scans independently); tokens must be unique,
+// and restoration is order-independent because each token is a unique
+// sentinel, e.g. <!--#PROTECTED:bracketButton:0#-->.
+//
+// The regexes below are written against the ACTUAL markup in the two
+// templates (verified against the files), not idealized markup:
+//
+//  - bracketButton: the 3-cell 340px table with ai-nl-btn-left.png / #41b6e6
+//    middle cell / ai-nl-btn-right.png. Its href carries the external
+//    deep-link anchor (#artN) — protected so the model can't mangle it, and
+//    renumbered positionally after restore (see renumberArticles).
+//  - articleStripImage: the per-article PNG header-strip <img> tags
+//    (article-N-top-sX.png) that frame each AI-in-Focus title. Protected so
+//    the model can't alter dimensions or invent filenames; the article NUMBER
+//    in the path is stamped positionally after restore. NOTE: only the <img>
+//    tags are protected — the title TEXT cell that sits between s2 and s3
+//    stays editable, so the model still writes each article's title.
+//  - footer: same region your extractFooter() already guards, folded in here
+//    so ALL protected regions restore through one path.
+
+const PROTECT_RULES = [
+  {
+    name: "bracketButton",
+    // 340px-wide 3-cell table: left PNG bracket, #41b6e6 middle, right PNG bracket
+    re: /<table[^>]*width:\s*340px[^>]*>[\s\S]*?ai-nl-btn-left\.png[\s\S]*?ai-nl-btn-right\.png[\s\S]*?<\/table>/gi,
+  },
+  {
+    name: "articleStripImage",
+    // Per-article header-strip PNGs: article-N-top-s1..s4.png. One token per
+    // <img>. Does not overlap bracketButton (different filenames).
+    re: /<img\b[^>]*article-\d+-top-s\d+\.png[^>]*>/gi,
+  },
+  {
+    name: "footer",
+    re: /<!--\s*START FOOTER\s*-->[\s\S]*?<!--\s*END FOOTER\s*-->/gi,
+  },
+];
+
+/**
+ * Extract all protected regions, returning cleaned HTML (tokens in place) plus
+ * a restore map. Restoration is exact — the model never influences these bytes.
+ */
+function protectFragileRegions(html) {
+  const store = {}; // token -> original markup
+  let out = html;
+
+  for (const rule of PROTECT_RULES) {
+    let i = 0;
+    out = out.replace(rule.re, (match) => {
+      const token = `<!--#PROTECTED:${rule.name}:${i}#-->`;
+      store[token] = match;
+      i++;
+      return token;
+    });
+  }
+  return { html: out, store };
+}
+
+/**
+ * Restore every protected token. If the model dropped a token entirely (e.g.
+ * deleted a whole article that had a bracket button), that protected block is
+ * simply not reinserted — which is correct: it went with the block the model
+ * chose to remove. Tokens the model kept are restored byte-for-byte. When the
+ * model DUPLICATED a token (copied the canonical block N times), every copy is
+ * restored to the same original — the per-article numbering is corrected
+ * afterward by renumberArticles().
+ */
+function restoreFragileRegions(html, store) {
+  let out = html;
+  let restored = 0;
+  let missing = 0;
+  for (const [token, original] of Object.entries(store)) {
+    if (out.includes(token)) {
+      out = out.split(token).join(original);
+      restored++;
+    } else {
+      missing++;
+    }
+  }
+  return { html: out, restored, missing, total: Object.keys(store).length };
+}
+
+/**
+ * Post-generation integrity check for protected tokens: catches the failure
+ * mode where the model emitted a MALFORMED token (e.g. altered the sentinel)
+ * so it neither matches for restoration nor is cleanly absent. Any leftover
+ * "#PROTECTED:" fragment that isn't an exact known token is a red flag.
+ */
+function findCorruptedTokens(html, store) {
+  const known = new Set(Object.keys(store));
+  const found = html.match(/<!--#PROTECTED:[^#]*#-->/g) || [];
+  return found.filter(t => !known.has(t));
+}
+
+// ═════════════════════════════════════════════
+// Deterministic per-article renumbering (AI-in-Focus only)
+// ═════════════════════════════════════════════
+//
+// The article NUMBER in three coupled places is purely positional:
+//   - image paths        article-N-top-sX.png
+//   - title cell id       id="artN"
+//   - button deep-link    href="...ai-in-focus/05-26#artN"  (inside the
+//                         protected bracketButton, restored just above)
+//
+// The model is told NOT to manage these numbers. After restore, every article
+// carries the canonical block's numbers (all "1"). This pass walks the emitted
+// articles in document order and stamps the correct sequential number on each.
+// This also cleans up the source template's own numbering drift (the original
+// had id run art1,art2,art3,art4,art4 and anchors art1..art5).
+//
+// Delimiter: the <!-- START ARTICLE --> comment, which begins the canonical
+// block and is therefore copied at the head of every emitted article. The head
+// (before the first article) and tail (footer etc.) contain none of these
+// patterns, so they are safe even though the last segment includes the tail.
+function renumberArticles(html, variant) {
+  if (variant !== "aiInFocus") return { html, count: 0 };
+
+  const parts = html.split(/<!--\s*START ARTICLE\s*-->/i);
+  if (parts.length < 2) {
+    return { html, count: 0, warning: "no <!-- START ARTICLE --> markers found; numbering left as-is" };
+  }
+
+  let rebuilt = parts[0]; // head, untouched
+  let n = 0;
+  for (let k = 1; k < parts.length; k++) {
+    n += 1;
+    const seg = parts[k]
+      .replace(/article-\d+-top-s(\d+)\.png/gi, `article-${n}-top-s$1.png`)
+      .replace(/id="art\d+"/gi, `id="art${n}"`)
+      .replace(/#art\d+\b/gi, `#art${n}`);
+    rebuilt += "<!-- START ARTICLE -->" + seg;
+  }
+  return { html: rebuilt, count: n };
+}
+
+// ═════════════════════════════════════════════
+// canonical article-block extraction
+// ═════════════════════════════════════════════
+//
+// Rather than hand the model the whole template, we give it exactly
+// ONE representative article block as the structural contract, plus the region
+// boundaries so it knows where blocks go. The model then emits N blocks that
+// match that structure. We keep the FIRST block verbatim as the example and
+// remove the rest, leaving a single insertion marker.
+
+/**
+ * For AI-in-Focus: articles are delimited by <!-- START ARTICLE --> markers
+ * with no end marker (the next START ARTICLE or <!-- END MAIN CONTENT --> is
+ * the boundary — this quirk is documented in brand-guide sectionMarkers).
+ * For Town Hall: repeating highlight rows keyed by the 320x181 highlight-img
+ * cell.
+ *
+ * Returns { canonicalBlock, shellHtml } where shellHtml has all repeating
+ * blocks replaced by a single <!--#ARTICLES#--> insertion marker, and
+ * canonicalBlock is one representative block (with its own fragile regions
+ * still tokenized, since protectFragileRegions ran first).
+ */
+function extractArticleShells(html, variant) {
+  if (variant === "aiInFocus") {
+    // Articles are delimited by <!-- START ARTICLE --> with no end marker; the
+    // repeating region ends at <!-- END MAIN CONTENT -->. So:
+    //   head              = everything before the first START ARTICLE
+    //   repeating region  = first START ARTICLE ... up to END MAIN CONTENT
+    //   tail              = END MAIN CONTENT ... EOF (includes footer token)
+    const marker = /<!--\s*START ARTICLE\s*-->/i;
+    const firstIdx = html.search(marker);
+    if (firstIdx === -1) return { canonicalBlock: null, shellHtml: html };
+
+    const endMainRe = /<!--\s*END MAIN CONTENT\s*-->/i;
+    const endMainIdx = html.search(endMainRe);
+    // If END MAIN CONTENT is absent, fall back to the footer token boundary.
+    const footerIdx = html.search(/<!--#PROTECTED:footer/i);
+    const regionEnd = endMainIdx !== -1
+      ? endMainIdx
+      : (footerIdx !== -1 ? footerIdx : html.length);
+
+    const head = html.slice(0, firstIdx);
+    const region = html.slice(firstIdx, regionEnd);
+    const tail = html.slice(regionEnd); // starts at END MAIN CONTENT, carries footer token through
+
+    // Canonical block = the FIRST article only (first START ARTICLE up to the
+    // next START ARTICLE within the region, or the whole region if only one).
+    const secondIdx = region.slice(1).search(marker); // search after char 0
+    const canonicalBlock = secondIdx === -1
+      ? region
+      : region.slice(0, secondIdx + 1);
+
+    const shellHtml = head + "<!--#ARTICLES#-->\n" + tail;
+    return { canonicalBlock, shellHtml };
+  }
+
+  if (variant === "aicpaTownHall") {
+    // Repeating unit = the table row containing a highlight-img cell (320x181)
+    // plus its adjacent text cell. Capture one full <tr>...</tr> that contains
+    // highlight-img as the canonical block.
+    const rowRe = /<tr>(?:(?!<\/tr>)[\s\S])*?highlight-img[\s\S]*?<\/tr>/i;
+    const firstRow = html.match(rowRe);
+    if (!firstRow) return { canonicalBlock: null, shellHtml: html };
+
+    // Replace all such rows with a single insertion marker.
+    const allRowsRe = /<tr>(?:(?!<\/tr>)[\s\S])*?highlight-img[\s\S]*?<\/tr>/gi;
+    let replaced = false;
+    const shellHtml = html.replace(allRowsRe, () => {
+      if (replaced) return "";
+      replaced = true;
+      return "<!--#ARTICLES#-->";
+    });
+    return { canonicalBlock: firstRow[0], shellHtml };
+  }
+
+  return { canonicalBlock: null, shellHtml: html };
+}
+
+// ═════════════════════════════════════════════
+// model-driven generation for design templates
+// ═════════════════════════════════════════════
+
+const DESIGN_SYSTEM_ADDENDUM = `
+DESIGN / REPEATING-BLOCK TEMPLATE MODE:
+You are populating a newsletter with a repeating article/highlight structure.
+You are given:
+  1. A SHELL with a single <!--#ARTICLES#--> marker showing where blocks go.
+  2. ONE CANONICAL BLOCK showing the exact required structure of each block.
+  3. SOURCE CONTENT to draw from.
+
+Your task:
+- Decide how many blocks the source content naturally warrants (do not pad).
+- For EACH block, reproduce the canonical block's structure EXACTLY, changing
+  only the editorial content (title text and body copy). Keep every style
+  attribute, table structure, and class identical to the canonical block.
+- Begin EACH block with the <!-- START ARTICLE --> comment exactly as it
+  appears at the top of the canonical block. This marker delimits block
+  boundaries and must be present on every block.
+- Tokens of the form <!--#PROTECTED:...#--> are opaque. Copy them through
+  verbatim into each block wherever they appear in the canonical block. NEVER
+  alter, expand, remove, or reorder the characters inside a protected token.
+  They are placeholders for fragile pre-built markup that will be restored
+  after you finish.
+- Replace the single <!--#ARTICLES#--> marker in the shell with all your
+  blocks concatenated in reading order.
+- Output the COMPLETE shell with blocks inserted. Raw HTML only, nothing else.
+
+DO NOT MANAGE NUMBERING:
+- Do NOT renumber or edit image paths, element ids, or link anchors between
+  blocks (e.g. article-N image paths, id="artN", #artN anchors). Copy them
+  from the canonical block exactly as-is — including inside protected tokens.
+  Sequential per-block numbering is applied automatically after you finish, so
+  any numbers you see in the canonical block are placeholders; leave them
+  untouched rather than trying to increment them.
+
+EDITORIAL JUDGMENT (this is yours to exercise):
+- Order blocks from top-to-bottom in the order they appear in the source
+  document or provided body content.
+- Write block titles and body copy from the source; keep them tight and
+  on-brand. Match the density/tone notes provided.
+- If the source clearly maps to fewer blocks than the canonical example
+  implies, use fewer. If more, use more. Never invent facts, URLs, or stats
+  not present in the source or instructions.`;
+
+/**
+ * Generate a design (repeating-block) template, model-driven, with fragile
+ * markup protected across the round-trip and per-article numbering stamped
+ * deterministically afterward.
+ *
+ * @param {object}   deps  injected server.js helpers so this module stays
+ *                         decoupled: { anthropic, AI_SYSTEM_PROMPT,
+ *                         extractHtml, logUsage, getBrandGuide }
+ */
+async function generateDesignHTML(ticket, templateName, templateHtml, sourceContent, deps) {
+  const { anthropic, AI_SYSTEM_PROMPT, extractHtml, logUsage, getBrandGuide } = deps;
+  const variant = designVariant(templateName);
+
+  // 1. Protect fragile regions (bracket buttons, strip images, footer) FIRST.
+  const { html: protectedHtml, store } = protectFragileRegions(templateHtml);
+
+  // 2. Extract the canonical block + build the shell with an insertion marker.
+  const { canonicalBlock, shellHtml } = extractArticleShells(protectedHtml, variant);
+
+  if (!canonicalBlock) {
+    // Structure not recognized — signal caller to fall back to the normal path
+    // rather than silently producing a broken newsletter.
+    const err = new Error(`Could not extract canonical block for "${templateName}" — falling back to standard generation.`);
+    err.code = "NO_CANONICAL_BLOCK";
+    throw err;
+  }
+
+  // 3. Pull variant-specific tone/structure notes from the brand guide so the
+  //    prompt carries the documented quirks (font-weight 400 body, navy
+  //    section headers, protected bracket buttons, etc.).
+  let brandNotes = "";
+  try {
+    const bg = await getBrandGuide();
+    const v = bg?.archetypes?.newsletter?.variants?.[variant];
+    if (v) brandNotes = `\nBRAND VARIANT NOTES for this template:\n${v}\n`;
+  } catch { /* brand guide optional here; addendum already carries the contract */ }
+
+  const message = await anthropic.messages.create({
+    model: "claude-opus-4-6",
+    max_tokens: 16000,
+    system: [
+      { type: "text", text: AI_SYSTEM_PROMPT, cache_control: { type: "ephemeral" } },
+      { type: "text", text: DESIGN_SYSTEM_ADDENDUM },
+    ],
+    messages: [{
+      role: "user",
+      content:
+        `Template: ${templateName}\n` +
+        `Subject: ${ticket.subjectLine || ticket.name || ""}\n` +
+        brandNotes +
+        `\nCANONICAL BLOCK (reproduce this structure exactly per article; ` +
+        `protected tokens must be copied through verbatim):\n\n${canonicalBlock}\n\n` +
+        `SHELL (insert all blocks where the <!--#ARTICLES#--> marker is):\n\n${shellHtml}\n\n` +
+        `SOURCE CONTENT to turn into blocks:\n${sourceContent || "(use the description below)"}\n\n` +
+        `Description: ${ticket.description || ""}\n` +
+        (ticket.__freeform__ ? `\nAdditional requestor instructions:\n${ticket.__freeform__}\n` : ""),
+    }],
+  });
+
+  const raw = message.content.find(b => b.type === "text")?.text ?? "";
+  logUsage(`generate-design "${ticket.name}"`, message);
+  let html = extractHtml(raw, shellHtml);
+
+  // 4. Integrity check BEFORE restoring: did the model corrupt any tokens?
+  const corrupted = findCorruptedTokens(html, store);
+  if (corrupted.length > 0) {
+    console.warn(`[design] ${corrupted.length} corrupted protected token(s) in "${ticket.name}": ${corrupted.join(", ")}`);
+  }
+
+  // 5. If the model left the insertion marker unreplaced, it failed the task.
+  if (html.includes("<!--#ARTICLES#-->")) {
+    console.warn(`[design] Model left #ARTICLES# marker unreplaced for "${ticket.name}" — restoring what we can.`);
+  }
+
+  // 6. Restore all protected regions byte-for-byte.
+  const { html: restored, restored: n, missing, total } = restoreFragileRegions(html, store);
+  console.log(`[design] Protected regions restored: ${n}/${total} (${missing} intentionally dropped with removed blocks)`);
+
+  // 7. Stamp sequential per-article numbering (AI-in-Focus only; no-op elsewhere).
+  const { html: finalHtml, count, warning } = renumberArticles(restored, variant);
+  if (warning) console.warn(`[design] renumber for "${ticket.name}": ${warning}`);
+  else if (count) console.log(`[design] renumbered ${count} article(s) sequentially`);
+
+  return finalHtml;
+}
+
+/**
  * ---------------------------------------------------------------------------
  * RAG few-shot template retrieval layer.
  * Drop these functions into server.js alongside fetchTemplateIndex() /
@@ -284,32 +672,6 @@ async function githubPutFileRetry(path, data, message, sha) {
   const json = await res.json();
   return json.content.sha;
 }
-
-/**
- * NOTE on fetchTemplateIndex(): your current implementation filters to
- * `.html` only. Add an `{ includeNonHtml }` option so this module can resolve
- * raw filenames (needed by ensureManifestUpToDate() below to detect new
- * templates dropped in the folder) through the same cached index rather than
- * writing a second Graph listing call:
- *
- *   async function fetchTemplateIndex({ includeNonHtml = false } = {}) {
- *     ...
- *     for (const item of (data.value || [])) {
- *       if (includeNonHtml) {
- *         map[item.name] = item.id;          // raw filename, not display-cased
- *       } else if (/\.html$/i.test(item.name)) {
- *         map[fileNameToDisplayName(item.name)] = item.id;
- *       }
- *     }
- *     ...
- *   }
- *
- * (Two different key styles — display-cased for html templates, raw filename
- * for the new-file diff — so both existing and new callers keep working
- * unmodified. Note: manifest.json/brand-guide.json no longer live in
- * SharePoint at all now, so this option is only needed for detecting new
- * .html templates, not for locating JSON files.)
- */
 
 async function getManifest() {
   if (manifestCache && Date.now() - manifestCache.fetchedAt < CACHE_TTL_MS) {
