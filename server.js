@@ -1178,45 +1178,70 @@ function buildButton(text, url, colorName, style = "solid") {
 }
 
 // ═════════════════════════════════════════════
-// Instructions parsing + variable substitution
+// Requestor prompt
 // ═════════════════════════════════════════════
 
-// TOP-LEVEL labels in the Instructions column. These are the only boundaries.
-// BodyContent is a mixed region: after "BodyContent:" the value may contain a
-// free mix of plain text and inline Button blocks, rendered IN ORDER. Button/
-// Link/Color/Style are NOT top-level labels — they live inside BodyContent.
-// BodyText is kept as a backward-compatible alias for BodyContent.
-// Prompt: maps to __freeform__ (agent instructions).
-const CAPTURE_LABELS = ["PreheaderText", "PreheaderLink", "HeaderImage", "HeaderLink", "Partner", "BodyContent", "BodyText", "Prompt"];
-// Back-compat alias
-const VARIABLE_NAMES = CAPTURE_LABELS;
-
+// ---------------------------------------------------------------------------
+// New prompt column is a FREEFORM PROMPT by default.
+// Any text not claimed by a recognized label becomes __freeform__ (the prompt
+// passed to the model). No "Prompt:" preface required anymore.
+//
+// Labels are now split into two kinds, which fixes a real fragility: in a
+// freeform-first column, a stray label mid-prose used to swallow everything
+// after it. So:
+//   SINGLE_LINE_LABELS — value is the REST OF THAT LINE only. These are the
+//     mechanical directives (asset lookup, token substitution) whose values
+//     are always short (a filename, a URL, a name). Safe to drop into prose.
+//   BLOCK_LABELS — value runs until the next recognized label or end. These
+//     are multi-line content regions (BodyContent) and the legacy Prompt:
+//     alias (still accepted, merged into __freeform__).
+// ---------------------------------------------------------------------------
+const SINGLE_LINE_LABELS = ["PreheaderText", "PreheaderLink", "HeaderImage", "HeaderLink", "Partner"];
+const BLOCK_LABELS       = ["BodyContent", "BodyText", "Prompt"];
+ 
 function parseInstructions(instructions) {
   const vars = {};
   if (!instructions) return vars;
-
-  const pattern = new RegExp(
-    `(${CAPTURE_LABELS.join("|")})\\s*:\\s*([\\s\\S]*?)(?=(?:${CAPTURE_LABELS.join("|")})\\s*:|$)`,
+ 
+  // 1. Pull out single-line labels (value = remainder of that line), removing
+  //    each matched line from the text so it doesn't bleed into the prompt.
+  let remaining = instructions;
+  for (const label of SINGLE_LINE_LABELS) {
+    const re = new RegExp(`^[ \\t]*${label}\\s*:\\s*(.*)$`, "gim");
+    remaining = remaining.replace(re, (_m, val) => {
+      const v = (val || "").trim().replace(/^"|"$/g, "");
+      if (v) vars[label] = v;
+      return ""; // strip the directive line
+    });
+  }
+   // 2. Handle block labels within what's left. Capture from a block label up
+  //    to the next block label (or end).
+  const blockPattern = new RegExp(
+    `(${BLOCK_LABELS.join("|")})\\s*:\\s*([\\s\\S]*?)(?=(?:${BLOCK_LABELS.join("|")})\\s*:|$)`,
     "gi"
   );
   let match;
-  let firstLabelIndex = -1;
-  while ((match = pattern.exec(instructions)) !== null) {
-    if (firstLabelIndex === -1) firstLabelIndex = match.index;
-    const key = match[1].trim();
-    const val = match[2].trim().replace(/^"|"$/g, "");
-    if (!key) continue;
-    const lk = key.toLowerCase();
-    if (lk === "prompt") {
-      if (val) vars["__freeform__"] = val;
-    } else if (lk === "bodycontent" || lk === "bodytext") {
-      // Merge body blocks (and normalise BodyText → BodyContent)
-      if (val) vars["BodyContent"] = vars["BodyContent"] ? `${vars["BodyContent"]}\n\n${val}` : val;
-    } else if (val) {
-      vars[key] = val;
+  let firstBlockIdx = -1;
+  while ((match = blockPattern.exec(remaining)) !== null) {
+    if (firstBlockIdx === -1) firstBlockIdx = match.index;
+    const key = match[1].toLowerCase();
+    const val = (match[2] || "").trim().replace(/^"|"$/g, "");
+    if (!val) continue;
+    if (key === "prompt") {
+      vars["__freeform__"] = vars["__freeform__"] ? `${vars["__freeform__"]}\n\n${val}` : val;
+    } else { // bodycontent | bodytext
+      vars["BodyContent"] = vars["BodyContent"] ? `${vars["BodyContent"]}\n\n${val}` : val;
     }
   }
-
+ 
+  // 3. Everything NOT claimed by a block label is freeform prompt.
+  if (firstBlockIdx === -1) {
+    const all = remaining.trim();
+    if (all) vars["__freeform__"] = vars["__freeform__"] ? `${all}\n\n${vars["__freeform__"]}` : all;
+  } else {
+    const lead = remaining.slice(0, firstBlockIdx).trim();
+    if (lead) vars["__freeform__"] = vars["__freeform__"] ? `${lead}\n\n${vars["__freeform__"]}` : lead;
+  }
   // Any text before the first recognised label is treated as leading body copy.
   if (firstLabelIndex > 0) {
     const lead = instructions.slice(0, firstLabelIndex).trim();
@@ -1228,6 +1253,66 @@ function parseInstructions(instructions) {
   }
 
   return vars;
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+if (require.main === module) {
+  const cases = [
+    {
+      name: "Pure prompt, no labels → all __freeform__",
+      in: "Write the May AI in Focus newsletter from the attached doc. Keep each article tight.",
+      expect: v => v.__freeform__ && !v.BodyContent && !v.HeaderImage,
+    },
+    {
+      name: "Prompt + single-line HeaderImage (label does NOT swallow following prose)",
+      in: "Build the general announcement email.\nHeaderImage: spring-promo.png\nMake the tone upbeat and mention the June 1 deadline.",
+      expect: v =>
+        v.HeaderImage === "spring-promo.png" &&
+        /upbeat/.test(v.__freeform__) &&
+        /general announcement/.test(v.__freeform__) &&
+        !/spring-promo/.test(v.__freeform__),
+    },
+    {
+      name: "Legacy Prompt: label still merges into __freeform__",
+      in: "Prompt: Emphasize the early-bird discount and keep it under 150 words.",
+      expect: v => /early-bird/.test(v.__freeform__) && !v.BodyContent,
+    },
+    {
+      name: "BodyContent block still captured verbatim (power-user escape hatch)",
+      in: "Some framing for the model.\nBodyContent: Hi there,\n\nThis is literal copy.\n\nButton: Register\nLink: https://cpa.com/x",
+      expect: v =>
+        /literal copy/.test(v.BodyContent) &&
+        /Button: Register/.test(v.BodyContent) &&
+        /framing for the model/.test(v.__freeform__),
+    },
+    {
+      name: "Multiple single-line labels + prompt",
+      in: "PreheaderText: Your monthly roundup\nHeaderImage: hero.png\nPartner: BILL\nWrite a co-branded webinar invite; registration link is in the doc.",
+      expect: v =>
+        v.PreheaderText === "Your monthly roundup" &&
+        v.HeaderImage === "hero.png" &&
+        v.Partner === "BILL" &&
+        /co-branded webinar/.test(v.__freeform__),
+    },
+    {
+      name: "Empty input → empty vars",
+      in: "",
+      expect: v => Object.keys(v).length === 0,
+    },
+  ];
+ 
+  let pass = 0;
+  for (const c of cases) {
+    const v = parseInstructions(c.in);
+    let ok = false;
+    try { ok = c.expect(v); } catch { ok = false; }
+    console.log(`${ok ? "PASS" : "FAIL"}  ${c.name}`);
+    if (!ok) console.log("   got:", JSON.stringify(v));
+    if (ok) pass++;
+  }
+  console.log(`\n${pass}/${cases.length} passed`);
 }
 
 // ─────────────────────────────────────────────
@@ -1381,7 +1466,27 @@ async function generateHTML(ticket, templateName) {
   vars["JobNumber"] = ticket.jobNumber || "";
 
   let html = applyVariables(templateHtml, vars, ticket.instructions || "");
-
+  
+  if (design.isDesignTemplate(templateName)) {
+    const vars = parseInstructions(ticket.instructions);
+    const docContent = (ticket.id && ticket.id !== "manual")
+      ? await fetchWordDocContent(ticket.id) : null;
+    // Source the model lays out: doc first, then literal BodyContent, then the prompt itself.
+    const sourceContent = docContent?.html || vars["BodyContent"] || vars["__freeform__"] || "";
+    // Only pass __freeform__ as *separate* instructions when it isn't already the source,
+    // so we don't duplicate it into the prompt twice.
+    ticket.__freeform__ = (sourceContent === vars["__freeform__"]) ? "" : (vars["__freeform__"] || "");
+    try {
+      let html = await design.generateDesignHTML(ticket, templateName, templateHtml, sourceContent,
+        { anthropic, AI_SYSTEM_PROMPT, extractHtml, logUsage, getBrandGuide });
+      if (ticket.id && ticket.id !== "manual") html = await applyHeaderImage(html, ticket.id, vars);
+      return html;
+    } catch (e) {
+      if (e.code !== "NO_CANONICAL_BLOCK") throw e;
+      // else fall through to the standard placeholder path below
+    }
+  }
+  
   const stillMissing = [];
   if (/BODY_CONTENT_HERE/.test(html) || /\{\{BodyContent\}\}/.test(html) || /\{\{BodyText\}\}/.test(html)) stillMissing.push("BodyContent");
   if (/\{\{PreheaderText\}\}/.test(html)) stillMissing.push("PreheaderText");
@@ -1402,18 +1507,17 @@ async function generateHTML(ticket, templateName) {
       messages: [{
         role: "user",
         content: `The following placeholders still need content: ${stillMissing.join(", ")}
-
-Ticket data:
-Name: ${ticket.name}
-Template: ${templateName}
-Subject Line: ${vars["Subject"]}
-Job Number: ${vars["JobNumber"]}
-Description: ${ticket.description || "No description provided."}
-Category: ${ticket.category || ""}
-Product: ${ticket.product || ""}
-${vars["__freeform__"] ? `\nAdditional instructions from the requestor (apply these when generating content):\n${vars["__freeform__"]}` : ""}${docContent ? `\nSOURCE CONTENT (from the attached Word document "${docContent.name}"). Use this as the basis for the email body. Rewrite/reformat it into brand-compliant, table-based email HTML for the BODY_CONTENT_HERE region — preserve its meaning, structure, headings, and links, but apply CPA.com styling. Do not copy any Word styling verbatim:\n${docContent.html}\n` : ""}
-HTML TEMPLATE (partially populated — only fill the remaining placeholders listed above):
-${html}`,
+          Ticket data:
+          Name: ${ticket.name}
+          Template: ${templateName}
+          Subject Line: ${vars["Subject"]}
+          Job Number: ${vars["JobNumber"]}
+          Description: ${ticket.description || "No description provided."}
+          Category: ${ticket.category || ""}
+          Product: ${ticket.product || ""}
+          ${vars["__freeform__"] ? `\nAdditional instructions from the requestor (apply these when generating content):\n${vars["__freeform__"]}` : ""}${docContent ? `\nSOURCE CONTENT (from the attached Word document "${docContent.name}"). Use this as the basis for the email body. Rewrite/reformat it into brand-compliant, table-based email HTML for the BODY_CONTENT_HERE region — preserve its meaning, structure, headings, and links, but apply CPA.com styling. Do not copy any Word styling verbatim:\n${docContent.html}\n` : ""}
+          HTML TEMPLATE (partially populated — only fill the remaining placeholders listed above):
+          ${html}`,
       }],
     });
     const rawGenerated = message.content.find(b => b.type === "text")?.text ?? "";
