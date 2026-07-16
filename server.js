@@ -338,24 +338,26 @@ function splitBodyArticles(body, variant) {
     const firstIdx = body.search(marker);
     if (firstIdx === -1) return { canonicalBlock: null, bodyWithMarker: body };
 
-    // Where the repeating region visually begins (module wrapper if present).
-    const moduleStart = body.search(/<!--\s*ARTICLE MODULE START\s*-->/i);
-    const regionStart = moduleStart !== -1 && moduleStart < firstIdx ? moduleStart : firstIdx;
+    // IMPORTANT structure note: all AI-in-Focus articles live inside ONE shared
+    // row+cell that opens at "ARTICLE MODULE START" (<tr><td border="0"
+    // valign="top">) and whose matching </td></tr> sits after END MAIN CONTENT.
+    // That shared cell (together with the START MAIN CONTENT column cell) is
+    // what constrains the articles to the 680px centered column — each article's
+    // own inner <table width:100%> is correct BECAUSE it's nested in that cell.
+    //
+    // So the shared wrapper must be PRESERVED, not regenerated: keep its opener
+    // on the intro side and its closer on the trailing side, and let the marker
+    // sit between them. The repeating unit the model reproduces is therefore
+    // only the inner <!-- START ARTICLE --><table>…</table> block — NOT a new
+    // row/cell.
+    const regionStart = firstIdx;                    // keep <tr><td> opener in intro
+    const endMainIdx  = body.search(/<!--\s*END MAIN CONTENT\s*-->/i);
+    const regionEnd   = endMainIdx !== -1 ? endMainIdx : body.length; // </td></tr> stays in trailing
 
-    // Where the repeating region ends. With the body now running to START
-    // FOOTER, there can be trailing structural markup (END MAIN CONTENT
-    // marker, a spacer row, closing table tags) AFTER the last article that
-    // must be preserved, not dropped.
-    const endMainRe = /<!--\s*END MAIN CONTENT\s*-->/i;
-    const endMainIdx = body.search(endMainRe);
-    const regionEnd = endMainIdx !== -1 ? endMainIdx : body.length;
+    const intro    = body.slice(0, regionStart);     // includes ARTICLE MODULE START + <tr><td>
+    const region   = body.slice(firstIdx, regionEnd); // the stacked inner article tables
+    const trailing = body.slice(regionEnd);           // END MAIN CONTENT + </td></tr> + spacer
 
-    const intro    = body.slice(0, regionStart);
-    const region   = body.slice(firstIdx, regionEnd); // articles only
-    const trailing = body.slice(regionEnd);           // END MAIN CONTENT + spacer + closers
-
-    // Canonical = the FIRST article (up to the next START ARTICLE, or the
-    // whole region if there's only one).
     const secondIdx = region.slice(1).search(marker);
     const canonicalBlock = secondIdx === -1 ? region : region.slice(0, secondIdx + 1);
 
@@ -424,6 +426,22 @@ B) THE ARTICLE REGION (the <!--#ARTICLES#--> marker):
    - Begin EACH article block with the <!-- START ARTICLE --> comment exactly
      as it appears at the top of the canonical block.
    - Use as many blocks as the source has articles — no more, no fewer.
+
+PRESERVE TABLE ATTRIBUTES EXACTLY:
+- When you reproduce the canonical article block, copy EVERY opening tag
+  verbatim — including width, align, valign, height, bgcolor, and the full
+  style attribute. Do NOT normalize, simplify, or "tidy" them. In particular:
+  - Never change a table's width (e.g. do not rewrite width="680" or
+    width:680px to width:100%, and vice-versa). Keep whatever the canonical
+    block has, character-for-character.
+  - Never drop align="center" (or align="right"/valign) from a tag that has it.
+  - Keep margin:auto and any other alignment styles intact.
+  These attributes are what keep each block aligned with the surrounding
+  680px centered column; altering them makes blocks misalign.
+- The <!--#ARTICLES#--> marker is already positioned INSIDE the correct
+  wrapping row/cell. Do NOT add a new <tr>, <td>, or wrapper table around your
+  article blocks — emit only the inner block structure exactly as the canonical
+  block shows, starting at its <!-- START ARTICLE --> comment.
 
 PROTECTED TOKENS:
 - Tokens of the form <!--#PROTECTED:...#--> are opaque placeholders for fragile
