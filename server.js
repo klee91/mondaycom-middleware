@@ -347,6 +347,113 @@ async function fixStripImageDimensions(html, variant, label = "") {
   return { html: out, fixed };
 }
 
+// ── Per-article CTA link injection (AI-in-Focus) ──
+// Each article's CTA is a PROTECTED bracket button, so the model can't write the
+// destination into it — after restore+renumber every button points at the
+// template placeholder anchor (…/ai-in-focus/05-26#artN). The real destinations
+// live in the source doc as one link per article.
+//
+// We must NOT assume the CTA label — it may be "Deep dive", "Read more",
+// "Learn more", "Full story", or unlabeled, and it varies by request. So rather
+// than string-match a label, we let the model read the doc top-to-bottom and
+// report each article's CTA URL in order (its judgment about which link is the
+// story link), then deterministically stamp those onto the buttons by position.
+//
+// Safety: only URLs that actually appear in the source doc are injected, so the
+// model can never introduce an invented destination (per the brand rule).
+
+// Map every href in the source to its exact authored form, keyed by an
+// entity-normalized version, so a model-returned URL can be matched back to the
+// precise string to inject (preserving &amp; etc.).
+function docHrefIndex(sourceContent) {
+  const map = new Map();
+  for (const m of (sourceContent || "").matchAll(/href="([^"]*)"/gi)) {
+    const norm = m[1].replace(/&amp;/gi, "&").trim();
+    if (norm && !map.has(norm)) map.set(norm, m[1]);
+  }
+  return map;
+}
+
+// Ask the model which link is each article's CTA, in article order. Flexible by
+// design: no reliance on the link's label text. Returns URLs in the doc's exact
+// authored form, validated to exist in the doc; unknown/empty slots become "".
+async function extractArticleCtaUrls(sourceContent, articleCount, label = "") {
+  if (!sourceContent || !articleCount) return [];
+  if (!/<a\b[^>]*href=/i.test(sourceContent)) return []; // no links → nothing to map
+  const hrefIndex = docHrefIndex(sourceContent);
+  if (hrefIndex.size === 0) return [];
+
+  try {
+    const response = await anthropic.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 600,
+      system:
+        "You identify the primary call-to-action (CTA) link for each article in a newsletter " +
+        "source document — the link a reader follows to read that article's full story. Do NOT " +
+        "rely on the link's wording: the CTA may be labeled 'Deep dive', 'Read more', 'Learn more', " +
+        "'Full story', an arrow, or nothing consistent. Judge by role and position, not text. " +
+        "Links in an introduction or a resources/round-up list that appear BEFORE the articles are " +
+        "NOT article CTAs — exclude them. Return ONLY JSON: {\"ctaUrls\": [\"url\", ...]} containing " +
+        "exactly one entry per article, in the same top-to-bottom order the articles appear. Copy " +
+        "each URL verbatim from the document. If a given article has no CTA link, use \"\" for that " +
+        "slot to preserve order. Never invent a URL.",
+      messages: [{
+        role: "user",
+        content:
+          `This newsletter has ${articleCount} article(s), in order.\n\n` +
+          `Source document:\n${sourceContent.slice(0, 16000)}`,
+      }],
+    });
+    const text = response.content.find(b => b.type === "text")?.text ?? "{}";
+    let parsed;
+    try { parsed = JSON.parse(text.replace(/```json|```/g, "").trim()); } catch { return []; }
+    const raw = Array.isArray(parsed.ctaUrls) ? parsed.ctaUrls : [];
+    // Validate each against the doc; map to the exact authored href or drop.
+    return raw.map(u => {
+      if (typeof u !== "string" || !u.trim()) return "";
+      const norm = u.replace(/&amp;/gi, "&").trim();
+      return hrefIndex.get(norm) || "";
+    });
+  } catch (err) {
+    console.warn(`[design] CTA URL identification skipped${label ? ` for "${label}"` : ""}: ${err.message}`);
+    return [];
+  }
+}
+
+// Stamp the per-article CTA URLs (already in article order) onto the protected
+// bracket buttons, replacing the #artN placeholder anchor.
+function applyArticleCtaLinks(html, ctaUrls, variant, label = "") {
+  if (variant !== "aiInFocus") return { html, applied: 0 };
+  if (!ctaUrls || ctaUrls.length === 0) return { html, applied: 0 };
+
+  const parts = html.split(/<!--\s*START ARTICLE\s*-->/i);
+  if (parts.length < 2) return { html, applied: 0 };
+
+  let rebuilt = parts[0]; // head, untouched
+  let applied = 0;
+  for (let k = 1; k < parts.length; k++) {
+    let seg = parts[k];
+    const url = ctaUrls[k - 1];
+    if (url) {
+      // Replace ONLY the bracket-button anchor hrefs (…#artN). All three <a>
+      // tags in the button share that href, so this catches the full button.
+      const before = seg;
+      seg = seg.replace(/href="[^"]*#art\d+"/gi, `href="${url}"`);
+      if (seg !== before) applied++;
+    }
+    rebuilt += "<!-- START ARTICLE -->" + seg;
+  }
+
+  const articleCount = parts.length - 1;
+  const provided = ctaUrls.filter(Boolean).length;
+  if (applied < articleCount) {
+    console.warn(`[design] applied ${applied}/${articleCount} article CTA link(s)${label ? ` for "${label}"` : ""} (${provided} URL(s) identified) — remaining buttons left on placeholder anchor`);
+  } else if (applied) {
+    console.log(`[design] applied ${applied} article CTA link(s)${label ? ` for "${label}"` : ""}`);
+  }
+  return { html: rebuilt, applied };
+}
+
 // Detect the BODY region (between header-end and footer-start), returning
 // { head, body, tail }. Body is what the model may re-map; head and tail are
 // preserved verbatim. Uses a prioritized set of markers because the templates
@@ -612,7 +719,14 @@ async function generateDesignHTML(ticket, templateName, templateHtml, sourceCont
 
   // 7. Correct each article's header-strip image dimensions to the real asset
   //    sizes (they differ per article; renumber only swaps the filename).
-  const { html: finalHtml } = await fixStripImageDimensions(renumbered, variant, ticket.name);
+  const { html: sized } = await fixStripImageDimensions(renumbered, variant, ticket.name);
+
+  // 8. Inject each article's CTA destination from the source doc into the
+  //    protected bracket button (replacing the #artN placeholder). The CTA link
+  //    is identified by role/position, not by any assumed label text.
+  const articleCount = (sized.match(/<!--\s*START ARTICLE\s*-->/gi) || []).length;
+  const ctaUrls = await extractArticleCtaUrls(sourceContent, articleCount, ticket.name);
+  const { html: finalHtml } = applyArticleCtaLinks(sized, ctaUrls, variant, ticket.name);
 
   return finalHtml;
 }
