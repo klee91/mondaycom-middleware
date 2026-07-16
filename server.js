@@ -276,6 +276,77 @@ function renumberArticles(html, variant) {
   return { html: rebuilt, count: n };
 }
 
+// ── Per-article strip-image dimension correction (AI-in-Focus) ──
+// The article header frame (article-N-top-s1..s4.png) is a DIFFERENT pre-made
+// asset per article, each with its own native pixel size (e.g. the top strip
+// s1 is 101px tall for article 1 but 41px for article 2). Because every
+// article is generated from the canonical (article-1) block and renumber only
+// swaps the filename number, each article inherits article-1's declared
+// width/height — which stretches the real asset. This pass reads each strip
+// image's TRUE dimensions from the PNG header and rewrites the <img> (and its
+// enclosing <td> size hint) to match, so nothing is forced out of aspect ratio.
+const pngDimCache = new Map(); // url -> { w, h } | "failed"
+
+async function fetchPngDimensions(url) {
+  if (pngDimCache.has(url)) {
+    const v = pngDimCache.get(url);
+    if (v === "failed") throw new Error("cached failure");
+    return v;
+  }
+  // Range request keeps this to a few dozen bytes; falls back fine if the
+  // server ignores Range and returns the whole file.
+  const res = await fetch(url, { headers: { Range: "bytes=0-33" } });
+  if (!res.ok && res.status !== 206) { pngDimCache.set(url, "failed"); throw new Error(`fetch ${res.status}`); }
+  const buf = Buffer.from(await res.arrayBuffer());
+  if (buf.length < 24 || buf.toString("ascii", 1, 4) !== "PNG") { pngDimCache.set(url, "failed"); throw new Error("not a PNG"); }
+  const dim = { w: buf.readUInt32BE(16), h: buf.readUInt32BE(20) };
+  pngDimCache.set(url, dim);
+  return dim;
+}
+
+async function fixStripImageDimensions(html, variant, label = "") {
+  if (variant !== "aiInFocus") return { html, fixed: 0 };
+
+  // Collect the distinct strip-image URLs actually present, and fetch their
+  // native dimensions in parallel (cached across generations).
+  const urlRe = /<img\b[^>]*\bsrc="([^"]*article-\d+-top-s\d+\.png)"[^>]*>/gi;
+  const urls = new Set();
+  let m;
+  while ((m = urlRe.exec(html)) !== null) urls.add(m[1]);
+  if (urls.size === 0) return { html, fixed: 0 };
+
+  const dims = new Map();
+  await Promise.all([...urls].map(async (url) => {
+    try { dims.set(url, await fetchPngDimensions(url)); }
+    catch (e) { console.warn(`[design] strip-image dimensions unavailable for ${url}: ${e.message}`); }
+  }));
+  if (dims.size === 0) return { html, fixed: 0 };
+
+  // Rewrite each "<td …><img … strip.png …>" pair: patch the img's width/height
+  // (attribute + inline style) and the enclosing td's width/height hint.
+  let fixed = 0;
+  const out = html.replace(
+    /(<td\b[^>]*>)(\s*)(<img\b[^>]*\bsrc="([^"]*article-\d+-top-s\d+\.png)"[^>]*>)/gi,
+    (whole, tdTag, ws, imgTag, url) => {
+      const d = dims.get(url);
+      if (!d) return whole;
+      const { w, h } = d;
+      const newImg = imgTag
+        .replace(/\bwidth="\d+"/i, `width="${w}"`)
+        .replace(/\bheight="\d+"/i, `height="${h}"`)
+        .replace(/(?<!-)\bwidth:\s*\d+px/i, `width: ${w}px`)
+        .replace(/(?<!-)\bheight:\s*\d+px/i, `height: ${h}px`);
+      const newTd = tdTag
+        .replace(/(?<!-)\bwidth:\s*\d+px/i, `width: ${w}px`)
+        .replace(/(?<!-)\bheight:\s*\d+px/i, `height: ${h}px`);
+      fixed++;
+      return newTd + ws + newImg;
+    }
+  );
+  if (fixed) console.log(`[design] corrected strip-image dimensions on ${fixed} image(s)${label ? ` for "${label}"` : ""}`);
+  return { html: out, fixed };
+}
+
 // Detect the BODY region (between header-end and footer-start), returning
 // { head, body, tail }. Body is what the model may re-map; head and tail are
 // preserved verbatim. Uses a prioritized set of markers because the templates
@@ -535,9 +606,13 @@ async function generateDesignHTML(ticket, templateName, templateHtml, sourceCont
   console.log(`[design] Protected regions restored: ${n}/${total} (${missing} intentionally dropped with removed blocks)`);
 
   // 6. Stamp sequential per-article numbering (AI-in-Focus only; no-op elsewhere).
-  const { html: finalHtml, count, warning } = renumberArticles(restored, variant);
+  const { html: renumbered, count, warning } = renumberArticles(restored, variant);
   if (warning) console.warn(`[design] renumber for "${ticket.name}": ${warning}`);
   else if (count) console.log(`[design] renumbered ${count} article(s) sequentially`);
+
+  // 7. Correct each article's header-strip image dimensions to the real asset
+  //    sizes (they differ per article; renumber only swaps the filename).
+  const { html: finalHtml } = await fixStripImageDimensions(renumbered, variant, ticket.name);
 
   return finalHtml;
 }
