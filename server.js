@@ -1259,6 +1259,66 @@ function extractHtml(raw, fallback) {
 }
 
 // ═════════════════════════════════════════════
+// Clarification questions
+// ═════════════════════════════════════════════
+// Per the brand brief, the agent should CONFIRM missing/ambiguous inputs with
+// the requestor rather than silently guessing — especially CTA destination
+// URLs, personalization, and (when unclear) the template choice. This runs one
+// cheap Haiku pass over the ticket inputs + the generated HTML and returns a
+// short list of questions to post back on the ticket. It never blocks the
+// draft; the draft is posted alongside the questions so the requestor sees
+// both. Returns [] on any failure so generation is never held up.
+async function analyzeForQuestions(ticket, vars, generatedHtml) {
+  try {
+    // Cheap deterministic signals to focus the model.
+    const hasAnyUrl = /href="https?:\/\//i.test(generatedHtml);
+    const usesFirstName = /\{\{Recipient\.FirstName\}\}/.test(generatedHtml);
+    const source = [ticket.description, vars["__freeform__"], vars["BodyContent"]].filter(Boolean).join("\n");
+
+    const response = await anthropic.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 400,
+      system:
+        "You review a marketing email ticket for a proof generator and list ONLY the " +
+        "genuinely blocking clarifications the requestor must answer before the email can " +
+        "be finalized. Follow this checklist: (1) every CTA/button must have a real " +
+        "destination URL — if any is missing or was left as a placeholder, ask for it; " +
+        "(2) confirm whether {{Recipient.FirstName}} personalization is intended if it's " +
+        "unclear; (3) any figure, stat, date, discount code, or claim that appears to be " +
+        "missing or a placeholder (TBD/TBC/XX) — ask, never invent. " +
+        "Respond ONLY with JSON: {\"questions\": [\"...\"]}. Each question one sentence, " +
+        "specific and actionable. If nothing is genuinely blocking, return " +
+        "{\"questions\": []}. Do NOT ask about styling, tone, or things already provided.",
+      messages: [{
+        role: "user",
+        content:
+          `Subject: ${ticket.subjectLine || ticket.name || ""}\n` +
+          `Template: ${ticket.template || ""}\n` +
+          `Provided content / instructions:\n${source || "(none beyond subject)"}\n\n` +
+          `Signals from the generated draft: containsAtLeastOneRealUrl=${hasAnyUrl}, ` +
+          `usesFirstNamePersonalization=${usesFirstName}\n\n` +
+          `Draft HTML (for detecting empty/placeholder CTAs and TBD copy):\n${(generatedHtml || "").slice(0, 12000)}`,
+      }],
+    });
+    const text = response.content.find(b => b.type === "text")?.text ?? "{}";
+    let parsed;
+    try { parsed = JSON.parse(text.replace(/```json|```/g, "").trim()); } catch { return []; }
+    const qs = Array.isArray(parsed.questions) ? parsed.questions.filter(q => typeof q === "string" && q.trim()) : [];
+    return qs.slice(0, 5);
+  } catch (err) {
+    console.warn(`[agent] clarification analysis skipped: ${err.message}`);
+    return [];
+  }
+}
+
+// Render a questions list into an HTML update snippet, or "" if none.
+function renderQuestionsBlock(questions) {
+  if (!questions || questions.length === 0) return "";
+  const items = questions.map(q => `<li>${q}</li>`).join("");
+  return `<p>Before this is final, a few things to confirm — reply with <strong>@agent</strong> and the answers:</p><ul>${items}</ul>`;
+}
+
+// ═════════════════════════════════════════════
 // Generate HTML (first proof)
 // ═════════════════════════════════════════════
 async function generateHTML(ticket, templateName) {
@@ -1571,6 +1631,15 @@ app.post("/api/webhook", async (req, res) => {
 
   res.json({ status: "received" });
   console.log(`[agent] event=${event.type} pulseId=${event.pulseId} boardId=${event.boardId}`);
+
+  // Keep the template manifest in sync with the SharePoint folder. getManifest()
+  // diffs the live folder against manifest.json and auto-tags + commits any NEW
+  // template (see ensureManifestUpToDate). It's cached (10 min) and only WRITES
+  // when a new template is found, so this is cheap and usually a no-op — but it's
+  // what makes the manifest a living index. Fire-and-forget so it never blocks or
+  // breaks proof generation.
+  getManifest().catch(err => console.warn(`[manifest] sync skipped: ${err.message}`));
+
   try {
     if (event.type === "create_pulse") {
       const itemId = String(event.pulseId);
@@ -1598,16 +1667,18 @@ app.post("/api/webhook", async (req, res) => {
       await uploadToMonday(itemId, fileName, html);
       await persistAgentState(itemId, 1, [], html);
 
+      const questions = await analyzeForQuestions(ticket, parseInstructions(ticket.instructions), html);
       const requestorId = await findUserIdByName(ticket.requestor);
       const mentionName = ticket.requestor.split(",")[0].trim();
       const mentionTag  = requestorId ? `<strong>@${mentionName}</strong> ` : "";
       await postUpdate(itemId,
         `<p>${mentionTag}Your email proof (v1) is ready and attached to this item's Files. ` +
         `Review it and reply with <strong>@agent</strong> followed by any changes you'd like. ` +
-        `When it's ready, set Status to <strong>Approved</strong>.</p>`,
+        `When it's ready, set Status to <strong>Approved</strong>.</p>` +
+        renderQuestionsBlock(questions),
         requestorId ? [requestorId] : []
       );
-      console.log(`[agent] Item ${itemId} v1 complete`);
+      console.log(`[agent] Item ${itemId} v1 complete${questions.length ? ` (${questions.length} question(s) posted)` : ""}`);
       return;
     }
 
@@ -1643,16 +1714,18 @@ app.post("/api/webhook", async (req, res) => {
         await uploadToMonday(itemId, fileName, html);
         await persistAgentState(itemId, 1, [], html);
 
+        const questions = await analyzeForQuestions(ticket, parseInstructions(ticket.instructions), html);
         const reqId    = await findUserIdByName(ticket.requestor);
         const reqName  = ticket.requestor.split(",")[0].trim();
         const reqTag   = reqId ? `<strong>@${reqName}</strong> ` : "";
         await postUpdate(itemId,
           `<p>${reqTag}Your email proof (v1) is ready and attached to this item's Files. ` +
           `Review it and reply with <strong>@agent</strong> followed by any changes you'd like. ` +
-          `When it's ready, set Status to <strong>Approved</strong>.</p>`,
+          `When it's ready, set Status to <strong>Approved</strong>.</p>` +
+          renderQuestionsBlock(questions),
           reqId ? [reqId] : []
         );
-        console.log(`[agent] Item ${itemId} v1 complete (via @agent)`);
+        console.log(`[agent] Item ${itemId} v1 complete (via @agent)${questions.length ? ` (${questions.length} question(s) posted)` : ""}`);
         return;
       }
 
