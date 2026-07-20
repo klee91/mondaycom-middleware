@@ -1526,33 +1526,69 @@ ${html}`,
 // ═════════════════════════════════════════════
 // Revise HTML (agent feedback loop)
 // ═════════════════════════════════════════════
-async function reviseHTML(currentHtml, feedback, history, freeform = "") {
-  const originalFooter = extractFooter(currentHtml);
+async function reviseHTML(currentHtml, feedback, history, freeform = "", opts = {}) {
+  const { variant = null } = opts;
   const historyText = history.length ? history.map((h, i) => `Round ${i + 1}: ${h}`).join("\n") : "(none)";
+
+  // Protect fragile regions so a revision can't re-warp strip images, break the
+  // bracket buttons, or disturb the footer. The model edits around opaque
+  // tokens; we restore them verbatim afterward.
+  const { html: protectedHtml, store } = protectFragileRegions(currentHtml);
+
+  const REVISE_RULES = `
+REVISION FIDELITY — READ CAREFULLY:
+- The CURRENT EMAIL HTML below is the SOURCE OF TRUTH, not a fresh template.
+  It already reflects earlier approved corrections by the requestor.
+- Apply ONLY the change described in NEW FEEDBACK. Reproduce EVERYTHING else
+  byte-for-byte — same text, same values, same attributes, same order.
+- Do NOT "restore", "normalize", or "clean up" anything. In particular:
+  * If a spot contains a literal value where a {{merge token}} once was (e.g.
+    a real date like "August 2026", a real URL, a job number), that is an
+    INTENTIONAL prior edit — KEEP IT. Never revert a literal value back to a
+    {{...}} token.
+  * Do not re-introduce placeholder tokens that are no longer present.
+  * Do not change links, dates, numbers, or copy that the feedback didn't
+    mention.
+- Tokens of the form <!--#PROTECTED:...#--> are opaque; copy them through
+  verbatim and never alter their contents.
+- Output the COMPLETE HTML, raw only (nothing before the first < or after the
+  last >).`;
 
   const message = await anthropic.messages.create({
     model: "claude-opus-4-6",
     max_tokens: 16000,
-    system: [{ type: "text", text: AI_SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
+    system: [{ type: "text", text: AI_SYSTEM_PROMPT + "\n" + REVISE_RULES, cache_control: { type: "ephemeral" } }],
     messages: [{
       role: "user",
-      content: `You previously generated this email proof. The requestor has reviewed it and given feedback. Apply ONLY the requested changes while keeping everything else intact and following all CPA.com brand standards.
+      content: `You previously generated this email proof. The requestor has reviewed it and given feedback. Apply ONLY the requested change; keep everything else exactly as it is in the CURRENT EMAIL HTML.
 ${freeform ? `\nSTANDING INSTRUCTIONS FROM REQUESTOR (remain in effect across all revisions):\n${freeform}\n` : ""}
-PRIOR FEEDBACK ROUNDS:
+PRIOR FEEDBACK ROUNDS (already applied — do not undo these):
 ${historyText}
 
 NEW FEEDBACK TO APPLY:
 ${feedback}
 
-CURRENT EMAIL HTML:
-${currentHtml}`,
+CURRENT EMAIL HTML (source of truth — preserve verbatim except for the change above):
+${protectedHtml}`,
     }],
   });
 
   const rawRevised = message.content.find(b => b.type === "text")?.text ?? "";
   logUsage("revise", message);
-  let html = extractHtml(rawRevised, currentHtml);
-  if (originalFooter && !hasFooter(html)) html = reattachFooter(html, originalFooter);
+  let html = extractHtml(rawRevised, protectedHtml);
+
+  // Integrity + restore protected regions.
+  const corrupted = findCorruptedTokens(html, store);
+  if (corrupted.length > 0) console.warn(`[revise] ${corrupted.length} corrupted protected token(s): ${corrupted.join(", ")}`);
+  html = restoreFragileRegions(html, store).html;
+
+  // Re-run the deterministic design passes so a revision can never regress
+  // article numbering or strip-image dimensions.
+  if (variant === "aiInFocus") {
+    html = renumberArticles(html, variant).html;
+    html = (await fixStripImageDimensions(html, variant, "revision")).html;
+  }
+
   return html;
 }
 
@@ -1844,7 +1880,11 @@ app.post("/api/webhook", async (req, res) => {
       }
 
       const ticketVars = parseInstructions(ticket.instructions);
-      const revised  = await reviseHTML(baseHtml, feedback, meta.history || [], ticketVars["__freeform__"] || "");
+      const reviseTemplate = await resolveTemplateName(ticket);
+      const revised  = await reviseHTML(
+        baseHtml, feedback, meta.history || [], ticketVars["__freeform__"] || "",
+        { variant: designVariant(reviseTemplate) }
+      );
       const newRev   = (meta.revision || 1) + 1;
       const fileName = `${ticket.name.replace(/\s+/g, "_")}_${ticket.jobNumber || itemId}_v${newRev}.html`;
 
