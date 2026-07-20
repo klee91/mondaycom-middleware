@@ -1084,7 +1084,7 @@ async function fetchItemById(itemId) {
 async function fetchTicketFiles(itemId) {
   const data = await mondayQuery(`
     query GetFiles($itemId: ID!) {
-      items(ids: [$itemId]) { assets { id name url public_url file_extension } }
+      items(ids: [$itemId]) { assets { id name url public_url file_extension created_at } }
     }
   `, { itemId });
   return data?.items?.[0]?.assets ?? [];
@@ -1107,13 +1107,29 @@ async function fetchWordDocContent(itemId) {
       return null;
     }
     const buffer = await downloadMondayAsset(doc);
-    const result = await mammoth.convertToHtml({ buffer });
-    const html = (result.value || "").trim();
+
+    // CRITICAL: by default mammoth inlines embedded images as base64 data URIs.
+    // A newsletter doc with a few pasted images becomes MILLIONS of tokens
+    // (one real doc measured ~749K tokens, ~746K of it base64) and blows the
+    // model's context window. The doc is only a source of TEXT and LINKS — the
+    // email uses hosted assets, not whatever was pasted into Word — so drop the
+    // image data entirely instead of embedding it.
+    const result = await mammoth.convertToHtml({ buffer }, {
+      convertImage: mammoth.images.imgElement(() => ({ src: "" })), // no base64
+    });
+    let html = (result.value || "").trim();
+    // Belt-and-suspenders: strip any base64 data URI that slipped through, and
+    // drop now-empty <img> tags so they don't clutter the source content.
+    html = html
+      .replace(/\s*src="data:[^"]*"/gi, ' src=""')
+      .replace(/<img\b[^>]*\bsrc=""[^>]*>/gi, "");
+
     if (!html) {
       console.warn(`Word doc "${doc.name}" produced no content.`);
       return null;
     }
-    console.log(`Extracted Word doc "${doc.name}" (${html.length} chars of HTML)`);
+    const approxTokens = Math.round(html.length / 4);
+    console.log(`Extracted Word doc "${doc.name}" (${html.length} chars, ~${approxTokens} tokens after image strip)`);
     return { name: doc.name, html };
   } catch (err) {
     console.warn(`Word doc extraction failed for ${itemId}: ${err.message}`);
@@ -1528,7 +1544,30 @@ ${html}`,
 // ═════════════════════════════════════════════
 async function reviseHTML(currentHtml, feedback, history, freeform = "", opts = {}) {
   const { variant = null } = opts;
-  const historyText = history.length ? history.map((h, i) => `Round ${i + 1}: ${h}`).join("\n") : "(none)";
+
+  // ── Input-size guard ──────────────────────────────────────────────────────
+  // The context window is ~1M tokens. A single email is ~11K tokens, so a
+  // healthy revise prompt is well under 30K. If currentHtml is wildly larger,
+  // something upstream duplicated content (e.g. a corrupted/compounded state
+  // blob) — sending it would blow the window with a 400. Fail loud and early
+  // with a clear message rather than firing a doomed multi-MB request.
+  const MAX_HTML_CHARS = 400_000; // ~100K tokens; ~10x a normal email, generous
+  if ((currentHtml || "").length > MAX_HTML_CHARS) {
+    throw new Error(
+      `revise aborted: base HTML is ${currentHtml.length} chars (>${MAX_HTML_CHARS}), ` +
+      `far larger than a normal email — likely a corrupted/compounded agent-state blob. ` +
+      `Not sending to the model. Reset this item's agent state (delete the ` +
+      `agent_state_*.json in Files) and regenerate.`
+    );
+  }
+  // Only the last few feedback rounds matter for applying the next edit; an
+  // unbounded history is both useless context and a slow token leak.
+  const MAX_HISTORY = 8;
+  const recent = history.length > MAX_HISTORY ? history.slice(-MAX_HISTORY) : history;
+  const historyText = recent.length
+    ? (history.length > MAX_HISTORY ? `(… ${history.length - MAX_HISTORY} earlier round(s) omitted)\n` : "") +
+      recent.map((h, i) => `Round ${history.length - recent.length + i + 1}: ${h}`).join("\n")
+    : "(none)";
 
   // Protect fragile regions so a revision can't re-warp strip images, break the
   // bracket buttons, or disturb the footer. The model edits around opaque
@@ -1636,11 +1675,25 @@ async function readCurrentHtml(itemId, meta) {
   if (!meta?.stateFile) return "";
   try {
     const assets = await fetchTicketFiles(itemId);
-    const match  = assets.find(a => a.name === meta.stateFile);
+    // add_file_to_column APPENDS, so multiple same-named state files can
+    // accumulate. Always pick the MOST RECENT one, not the first .find() hit.
+    const matches = assets
+      .filter(a => a.name === meta.stateFile)
+      .sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
+    const match = matches[0];
     if (!match) return "";
+    if (matches.length > 1) {
+      console.warn(`[agent] ${matches.length} copies of ${meta.stateFile} in Files for ${itemId} — using newest (${match.created_at}). Older copies should be purged.`);
+    }
     const buf  = await downloadMondayAsset(match);
     const blob = JSON.parse(buf.toString("utf-8"));
-    return blob.currentHtml || "";
+    const html = blob.currentHtml || "";
+    // Guard: a corrupted/compounded blob can be enormous. Refuse to feed it back.
+    if (html.length > 400_000) {
+      console.warn(`[agent] recovered HTML for ${itemId} is ${html.length} chars — abnormally large, treating as unrecoverable.`);
+      return "";
+    }
+    return html;
   } catch (err) {
     console.warn(`Could not recover HTML for ${itemId}: ${err.message}`);
     return "";
