@@ -65,6 +65,31 @@ async function fetchItemById(itemId) {
   return normalizeTicket(item);
 }
 
+// Fetch ALL of an item's columns with their display titles + text values, for
+// the fallback token-fill (match {{Token}} to a column by name). Formula
+// columns return their computed display_value. Empty-titled columns are dropped.
+async function fetchItemColumns(itemId) {
+  const data = await mondayQuery(`
+    query GetItemColumns($itemId: ID!) {
+      items(ids: [$itemId]) {
+        column_values {
+          id text
+          ... on FormulaValue { display_value }
+          column { title }
+        }
+      }
+    }
+  `, { itemId }, "2025-07");
+  const cvs = data?.items?.[0]?.column_values ?? [];
+  return cvs
+    .map(cv => ({
+      id: cv.id,
+      title: cv.column?.title || "",
+      value: (cv.display_value ?? cv.text ?? "").toString(),
+    }))
+    .filter(c => c.title);
+}
+
 // ═════════════════════════════════════════════
 // Monday files
 // ═════════════════════════════════════════════
@@ -166,4 +191,4 @@ async function applyHeaderImage(html, itemId, vars = {}) {
   }
 }
 
-module.exports = { mondayQuery, normalizeTicket, fetchItemById, fetchTicketFiles, downloadMondayAsset, fetchWordDocContent, replaceFirstImage, applyHeaderImage };
+module.exports = { mondayQuery, normalizeTicket, fetchItemById, fetchItemColumns, fetchTicketFiles, downloadMondayAsset, fetchWordDocContent, replaceFirstImage, applyHeaderImage };
