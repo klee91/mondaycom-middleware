@@ -1,12 +1,12 @@
 /**
- * helpers/generatation.js — top-level generation + revision orchestration:
+ * helpers/generation.js — top-level generation + revision orchestration:
  * footer protection, template resolution, clarification questions,
  * generateHTML (routing to design or standard path), reviseHTML.
  */
 const { anthropic, GEN_MODEL, CHEAP_MODEL, AI_SYSTEM_PROMPT } = require("./config");
 const { fetchTemplateFromSharePoint, fetchTemplateIndex } = require("./sharepoint");
-const { fetchWordDocContent, applyHeaderImage } = require("./monday");
-const { parseInstructions, applyVariables } = require("./instructions");
+const { fetchWordDocContent, applyHeaderImage, fetchItemColumns } = require("./monday");
+const { parseInstructions, applyVariables, fillTokensFromColumnMap } = require("./instructions");
 const { logUsage, extractHtml } = require("./utils");
 const {
   isDesignTemplate, designVariant, generateDesignHTML,
@@ -123,6 +123,28 @@ function renderQuestionsBlock(questions) {
 }
 
 // ═════════════════════════════════════════════
+// Fallback token fill from Monday columns
+// ═════════════════════════════════════════════
+// After normal substitution, fill any remaining {{Token}} placeholders from a
+// Monday column whose NAME matches the token — leaving anything without a
+// confident match (and all Pardot/namespaced/triple-brace tags) untouched.
+// Non-blocking: any failure just returns the html unchanged.
+async function finalizeTokens(html, ticket) {
+  if (!ticket?.id || ticket.id === "manual") return html;
+  try {
+    const columns = await fetchItemColumns(ticket.id);
+    if (!columns.length) return html;
+    const { html: out, filled, skipped } = fillTokensFromColumnMap(html, columns);
+    if (filled.length) console.log(`[tokens] filled ${filled.length} from columns: ${filled.join(", ")}`);
+    if (skipped.length) console.log(`[tokens] left ${skipped.length} unmatched (no column / ambiguous): ${skipped.join(", ")}`);
+    return out;
+  } catch (err) {
+    console.warn(`[tokens] column fill skipped for ${ticket.id}: ${err.message}`);
+    return html;
+  }
+}
+
+// ═════════════════════════════════════════════
 // Generate HTML (first proof)
 // ═════════════════════════════════════════════
 async function generateHTML(ticket, templateName) {
@@ -153,7 +175,7 @@ async function generateHTML(ticket, templateName) {
     try {
       let html = await generateDesignHTML(ticket, templateName, templateHtml, sourceContent);
       if (ticket.id && ticket.id !== "manual") html = await applyHeaderImage(html, ticket.id, vars);
-      return html;
+      return await finalizeTokens(html, ticket);
     } catch (e) {
       if (e.code !== "NO_CANONICAL_BLOCK") throw e;
       console.warn(`[design] falling back to standard path for "${ticket.name}": ${e.message}`);
@@ -209,7 +231,7 @@ ${html}`,
     html = await applyHeaderImage(html, ticket.id, vars);
   }
 
-  return html;
+  return await finalizeTokens(html, ticket);
 }
 
 // ═════════════════════════════════════════════
