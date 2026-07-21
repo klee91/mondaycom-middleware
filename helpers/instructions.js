@@ -143,4 +143,64 @@ function applyVariables(html, vars, instructions = "") {
   return out;
 }
 
-module.exports = { resolveColor, buildButton, parseInstructions, renderTextSegment, renderBodyContent, applyVariables, SINGLE_LINE_LABELS, BLOCK_LABELS };
+// ─────────────────────────────────────────────
+// Fallback token fill from Monday columns
+// ─────────────────────────────────────────────
+// After the normal substitution, a template may still contain {{Token}}
+// placeholders that nothing filled (e.g. {{IssueDate}}, {{HeaderLink}}). As a
+// default, try to fill each remaining DOUBLE-brace token from a Monday column
+// whose NAME matches the token name; if there's no confident match, leave the
+// token exactly as-is.
+//
+// Safety rules (false fills would put wrong data in a live email):
+//   - Only double-brace {{...}}. Triple-brace {{{...}}} are Pardot tags — skip.
+//   - Skip namespaced/dotted tokens like {{Recipient.FirstName}} (Pardot).
+//   - Match on a normalized name (lowercase, alphanumeric only). Use a column
+//     ONLY when the match is unambiguous: exactly one exact-normalized match,
+//     or (failing that) exactly one column whose name contains / is contained
+//     by the token name. Any ambiguity → leave the token alone.
+//   - Never fill from an empty column value.
+function normalizeName(s) {
+  return (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function fillTokensFromColumnMap(html, columns) {
+  // Build a normalized index of non-empty columns, tracking duplicate names.
+  const byNorm = new Map();       // normTitle -> { value, title }
+  const dupNorm = new Set();
+  for (const c of (columns || [])) {
+    const value = (c.value ?? "").toString().trim();
+    if (!value) continue;
+    const n = normalizeName(c.title);
+    if (!n) continue;
+    if (byNorm.has(n)) dupNorm.add(n);
+    else byNorm.set(n, { value, title: c.title });
+  }
+
+  const filled = [];
+  const skipped = [];
+
+  // Match tokens with optional 3rd brace so we can detect and skip triple.
+  const out = html.replace(/(\{\{\{?)\s*([^{}]+?)\s*(\}?\}\})/g, (whole, open, inner, close) => {
+    if (open !== "{{" || close !== "}}") return whole; // triple-brace Pardot tag → leave
+    const name = inner.trim();
+    if (!name || name.includes(".")) return whole;      // namespaced Pardot → leave
+    const n = normalizeName(name);
+    if (!n) return whole;
+
+    // 1. exact normalized match, unambiguous
+    if (byNorm.has(n) && !dupNorm.has(n)) { filled.push(name); return byNorm.get(n).value; }
+
+    // 2. unambiguous contains match (either direction)
+    const cands = [...byNorm.entries()]
+      .filter(([cn]) => !dupNorm.has(cn) && (cn.includes(n) || n.includes(cn)));
+    if (cands.length === 1) { filled.push(name); return cands[0][1].value; }
+
+    skipped.push(name); // no confident match → leave the token exactly as-is
+    return whole;
+  });
+
+  return { html: out, filled: [...new Set(filled)], skipped: [...new Set(skipped)] };
+}
+
+module.exports = { resolveColor, buildButton, parseInstructions, renderTextSegment, renderBodyContent, applyVariables, fillTokensFromColumnMap, SINGLE_LINE_LABELS, BLOCK_LABELS };
