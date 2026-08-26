@@ -1,11 +1,12 @@
 /**
- * helpers/generation.js — top-level generation + revision orchestration:
+ * helpers/generate.js — top-level generation + revision orchestration:
  * footer protection, template resolution, clarification questions,
  * generateHTML (routing to design or standard path), reviseHTML.
  */
 const { anthropic, GEN_MODEL, CHEAP_MODEL, AI_SYSTEM_PROMPT } = require("./config");
 const { fetchTemplateFromSharePoint, fetchTemplateIndex } = require("./sharepoint");
 const { fetchWordDocContent, applyHeaderImage, fetchItemColumns } = require("./monday");
+const { applyContentImages } = require("./images");
 const { parseInstructions, applyVariables, fillTokensFromColumnMap } = require("./instructions");
 const { logUsage, extractHtml } = require("./utils");
 const {
@@ -174,7 +175,10 @@ async function generateHTML(ticket, templateName) {
     ticket.__freeform__ = (sourceContent === vars["__freeform__"]) ? "" : (vars["__freeform__"] || "");
     try {
       let html = await generateDesignHTML(ticket, templateName, templateHtml, sourceContent);
-      if (ticket.id && ticket.id !== "manual") html = await applyHeaderImage(html, ticket.id, vars);
+      if (ticket.id && ticket.id !== "manual") {
+        html = await applyHeaderImage(html, ticket.id, vars);
+        html = await applyContentImages(html, ticket.id, vars);
+      }
       return await finalizeTokens(html, ticket);
     } catch (e) {
       if (e.code !== "NO_CANONICAL_BLOCK") throw e;
@@ -229,6 +233,7 @@ ${html}`,
 
   if (ticket.id && ticket.id !== "manual") {
     html = await applyHeaderImage(html, ticket.id, vars);
+    html = await applyContentImages(html, ticket.id, vars);
   }
 
   return await finalizeTokens(html, ticket);
