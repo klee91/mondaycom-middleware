@@ -149,6 +149,52 @@ async function fetchWordDocContent(itemId) {
   }
 }
 
+// Resolve which attached image the requestor meant for the header, WITHOUT
+// requiring the rigid "HeaderImage:" label. Given the attached image assets and
+// the raw prompt text, resolve in order of confidence:
+//   1. explicit HeaderImage: value — exact filename (case-insensitive)
+//   2. explicit HeaderImage: value — exact filename ignoring extension
+//   3. any attached image whose FULL filename appears in the prompt text
+//   4. any attached image whose basename (no extension) appears in the prompt
+// Ambiguity (more than one equally-good candidate) or no signal → null, and the
+// header is left unchanged. Only image file types are ever considered.
+const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|svg)$/i;
+
+function resolveHeaderAsset(assets, vars = {}) {
+  const images = (assets || []).filter(a => IMAGE_EXT_RE.test(a.name || ""));
+  if (images.length === 0) return { match: null, reason: "no image files attached" };
+
+  const norm = s => (s || "").toLowerCase().trim();
+  const stripExt = s => norm(s).replace(IMAGE_EXT_RE, "");
+  const explicit = norm(vars["HeaderImage"]);
+  const promptText = norm([vars["HeaderImage"], vars["__freeform__"], vars["BodyContent"]].filter(Boolean).join("\n"));
+
+  // 1 & 2: explicit HeaderImage: value
+  if (explicit) {
+    let m = images.find(a => norm(a.name) === explicit);
+    if (m) return { match: m, reason: `exact filename "${m.name}"` };
+    m = images.find(a => stripExt(a.name) === stripExt(explicit));
+    if (m) return { match: m, reason: `filename ignoring extension "${m.name}"` };
+  }
+
+  if (!promptText) return { match: null, reason: "no filename reference in prompt" };
+
+  // 3: full filename appears anywhere in the prompt
+  let byFull = images.filter(a => promptText.includes(norm(a.name)));
+  if (byFull.length === 1) return { match: byFull[0], reason: `filename mentioned in prompt "${byFull[0].name}"` };
+  if (byFull.length > 1) return { match: null, reason: `ambiguous: ${byFull.length} attached filenames appear in the prompt` };
+
+  // 4: basename (no extension) appears in the prompt — only when it's distinctive
+  const byBase = images.filter(a => {
+    const base = stripExt(a.name);
+    return base.length >= 3 && promptText.includes(base);
+  });
+  if (byBase.length === 1) return { match: byBase[0], reason: `image basename mentioned in prompt "${byBase[0].name}"` };
+  if (byBase.length > 1) return { match: null, reason: `ambiguous: ${byBase.length} attached images loosely match the prompt` };
+
+  return { match: null, reason: "no attached image matched the prompt" };
+}
+
 function replaceFirstImage(html, newUrl, linkUrl = "") {
   let replaced = false;
   return html.replace(/(<img\b[^>]*\bsrc=")([^"]*)("[^>]*>)/i, (m, pre, existingSrc, post) => {
@@ -164,31 +210,40 @@ function replaceFirstImage(html, newUrl, linkUrl = "") {
 }
 
 async function applyHeaderImage(html, itemId, vars = {}) {
-  const headerLink     = (vars["HeaderLink"]  || "").trim();
-  const headerFilename = (vars["HeaderImage"] || "").trim();
-  if (!headerFilename && !headerLink) return html;
+  const headerLink     = (vars["HeaderLink"] || "").trim();
+  const hasImageSignal = !!(vars["HeaderImage"] || vars["__freeform__"] || vars["BodyContent"]);
+  if (!hasImageSignal && !headerLink) return html;
+
   try {
-    if (headerFilename) {
+    let match = null;
+    if (hasImageSignal) {
       const assets = await fetchTicketFiles(itemId);
-      const match  = assets.find(a => a.name.toLowerCase() === headerFilename.toLowerCase());
+      const resolved = resolveHeaderAsset(assets, vars);
+      match = resolved.match;
       if (!match) {
-        console.warn(`Header image "${headerFilename}" not found in Files column for item ${itemId} — header left unchanged.`);
-        return headerLink ? replaceFirstImage(html, null, headerLink) : html;
+        // Only note it when the requestor clearly intended a header image.
+        if ((vars["HeaderImage"] || "").trim()) {
+          console.warn(`Header image not resolved for item ${itemId} (${resolved.reason}) — header left unchanged.`);
+        }
       }
+    }
+
+    if (match) {
       const publicUrl = match.public_url || match.url;
       if (!publicUrl) {
-        console.warn(`Header image "${headerFilename}" has no public URL — header left unchanged.`);
+        console.warn(`Header image "${match.name}" has no public URL — header left unchanged.`);
         return headerLink ? replaceFirstImage(html, null, headerLink) : html;
       }
-      console.log(`Header image set from Monday public_url (temporary): ${headerFilename}`);
+      console.log(`Header image set from Monday public_url (temporary): ${match.name}`);
       return replaceFirstImage(html, publicUrl, headerLink);
-    } else {
-      return replaceFirstImage(html, null, headerLink);
     }
+
+    // No image resolved: apply a header link if one was given, else leave as-is.
+    return headerLink ? replaceFirstImage(html, null, headerLink) : html;
   } catch (err) {
     console.warn(`Header image swap skipped for ${itemId}: ${err.message}`);
     return html;
   }
 }
 
-module.exports = { mondayQuery, normalizeTicket, fetchItemById, fetchItemColumns, fetchTicketFiles, downloadMondayAsset, fetchWordDocContent, replaceFirstImage, applyHeaderImage };
+module.exports = { mondayQuery, normalizeTicket, fetchItemById, fetchItemColumns, fetchTicketFiles, downloadMondayAsset, fetchWordDocContent, resolveHeaderAsset, replaceFirstImage, applyHeaderImage };
