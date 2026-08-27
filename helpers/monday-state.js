@@ -84,6 +84,23 @@ async function persistAgentState(itemId, revision, history, currentHtml) {
   `, { itemId, boardId: BOARD_ID, val: value });
 }
 
+// Set the item's Status column to a label (e.g. "Proofing"). Uses
+// change_simple_column_value, which for a status column matches the label text.
+// The label must exist on the board's Status column exactly as given. Any
+// failure is logged and swallowed so it never blocks proof delivery.
+async function setStatus(itemId, label) {
+  try {
+    await mondayQuery(`
+      mutation SetStatus($itemId: ID!, $boardId: ID!, $label: String!) {
+        change_simple_column_value(item_id: $itemId, board_id: $boardId, column_id: "status", value: $label) { id }
+      }
+    `, { itemId, boardId: BOARD_ID, label });
+    console.log(`[agent] Item ${itemId} status set to "${label}"`);
+  } catch (err) {
+    console.warn(`[agent] Could not set status to "${label}" for ${itemId}: ${err.message}`);
+  }
+}
+
 async function postUpdate(itemId, body, mentionIds = []) {
   const mentionsList = mentionIds.map(id => ({ id: parseInt(id, 10), type: "User" }));
   await mondayQuery(`
@@ -102,4 +119,4 @@ async function findUserIdByName(name) {
   return match ? match.id : null;
 }
 
-module.exports = { uploadToMonday, readAgentMeta, readCurrentHtml, persistAgentState, postUpdate, findUserIdByName };
+module.exports = { uploadToMonday, readAgentMeta, readCurrentHtml, persistAgentState, postUpdate, setStatus, findUserIdByName };
