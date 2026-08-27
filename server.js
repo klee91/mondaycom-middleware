@@ -33,7 +33,7 @@ const {
   mondayQuery, normalizeTicket, fetchItemById, fetchTicketFiles, fetchWordDocContent,
 } = require("./helpers/monday");
 const {
-  uploadToMonday, readAgentMeta, readCurrentHtml, persistAgentState, postUpdate, findUserIdByName,
+  uploadToMonday, readAgentMeta, readCurrentHtml, persistAgentState, postUpdate, setStatus, findUserIdByName,
 } = require("./helpers/monday-state");
 const {
   resolveTemplateName, analyzeForQuestions, renderQuestionsBlock, generateHTML, reviseHTML,
@@ -183,6 +183,7 @@ app.post("/api/webhook", async (req, res) => {
 
       await uploadToMonday(itemId, fileName, html);
       await persistAgentState(itemId, 1, [], html);
+      await setStatus(itemId, "Proofing");
 
       const questions = await analyzeForQuestions(ticket, parseInstructions(ticket.instructions), html);
       const requestorId = await findUserIdByName(ticket.requestor);
@@ -230,6 +231,7 @@ app.post("/api/webhook", async (req, res) => {
 
         await uploadToMonday(itemId, fileName, html);
         await persistAgentState(itemId, 1, [], html);
+        await setStatus(itemId, "Proofing");
 
         const questions = await analyzeForQuestions(ticket, parseInstructions(ticket.instructions), html);
         const reqId    = await findUserIdByName(ticket.requestor);
