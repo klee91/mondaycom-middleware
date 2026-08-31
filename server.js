@@ -160,21 +160,26 @@ app.post("/api/webhook", async (req, res) => {
   try {
     if (event.type === "create_pulse") {
       const itemId = String(event.pulseId);
-      console.log(`[agent] New item ${itemId} — generating first proof`);
 
+      // At ticket creation, only auto-run if a Word doc is already attached.
+      // Requestors often create placeholder tickets before content is ready, so
+      // prompt text alone (which may just be a placeholder) is NOT enough to
+      // start generation. If there's no doc, do nothing and wait — the
+      // requestor kicks it off later by tagging @MEG. Check this FIRST so empty
+      // placeholder tickets bail out immediately (no job-number retry delay).
+      const hasDoc = await fetchWordDocContent(itemId);
+      if (!hasDoc) {
+        console.log(`[agent] Item ${itemId} created without a Word doc — waiting for a doc or an @MEG tag before generating.`);
+        return;
+      }
+
+      console.log(`[agent] New item ${itemId} with doc attached — generating first proof`);
       let ticket = await fetchItemById(itemId);
 
       if (!ticket.jobNumber) {
         console.log(`[agent] Job Number empty for ${itemId} — retrying once after delay`);
         await new Promise(r => setTimeout(r, 3000));
         ticket = await fetchItemById(itemId);
-      }
-
-      const hasInstructions = !!(ticket.instructions && ticket.instructions.trim());
-      const hasDoc = await fetchWordDocContent(itemId);
-      if (!hasInstructions && !hasDoc) {
-        console.log(`[agent] Item ${itemId} has no Prompt and no Word doc — skipping generation`);
-        return;
       }
 
       const templateName = await resolveTemplateName(ticket);
