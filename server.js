@@ -33,7 +33,7 @@ const {
   mondayQuery, normalizeTicket, fetchItemById, fetchTicketFiles, fetchWordDocContent,
 } = require("./helpers/monday");
 const {
-  uploadToMonday, readAgentMeta, readCurrentHtml, persistAgentState, postUpdate, setStatus, findUserIdByName,
+  uploadToMonday, readAgentMeta, readCurrentHtml, persistAgentState, postUpdate, setStatus, recordProofVersion, findUserIdByName,
 } = require("./helpers/monday-state");
 const {
   resolveTemplateName, analyzeForQuestions, renderQuestionsBlock, generateHTML, reviseHTML,
@@ -179,11 +179,12 @@ app.post("/api/webhook", async (req, res) => {
 
       const templateName = await resolveTemplateName(ticket);
       const html         = await generateHTML(ticket, templateName);
-      const fileName     = `${ticket.name.replace(/\s+/g, "_")}_${ticket.jobNumber || itemId}_v1.html`;
+      const fileName     = `${ticket.name.replace(/\s+/g, "_")}_v1.html`;
 
-      await uploadToMonday(itemId, fileName, html);
+      const asset = await uploadToMonday(itemId, fileName, html);
       await persistAgentState(itemId, 1, [], html);
       await setStatus(itemId, "Proofing");
+      await recordProofVersion(itemId, { version: 1, fileName, assetUrl: asset?.url });
 
       const questions = await analyzeForQuestions(ticket, parseInstructions(ticket.instructions), html);
       const requestorId = await findUserIdByName(ticket.requestor);
@@ -191,7 +192,7 @@ app.post("/api/webhook", async (req, res) => {
       const mentionTag  = requestorId ? `<strong>@${mentionName}</strong> ` : "";
       await postUpdate(itemId,
         `<p>${mentionTag}Your email proof (v1) is ready and attached to this item's Files. ` +
-        `Review it and reply with <strong>@agent</strong> followed by any changes you'd like. ` +
+        `Review it and reply with <strong>@MEG</strong> followed by any changes you'd like. ` +
         `When it's ready, set Status to <strong>Approved</strong>.</p>` +
         renderQuestionsBlock(questions),
         requestorId ? [requestorId] : []
@@ -205,11 +206,11 @@ app.post("/api/webhook", async (req, res) => {
       const body   = (event.body || event.textBody || "").trim();
       const plain  = body.replace(/<[^>]+>/g, "").trim();
 
-      if (!/^@agent\b/i.test(plain)) {
-        console.log(`[agent] Update on ${itemId} ignored (no @agent prefix)`);
+      if (!/^@(MEG|agent)\b/i.test(plain)) {
+        console.log(`[agent] Update on ${itemId} ignored (no @MEG prefix)`);
         return;
       }
-      const feedback = plain.replace(/^@agent\b[:,\s]*/i, "").trim();
+      const feedback = plain.replace(/^@(MEG|agent)\b[:,\s]*/i, "").trim();
       if (!feedback) return;
 
       console.log(`[agent] Feedback on ${itemId}: "${feedback}"`);
@@ -224,14 +225,15 @@ app.post("/api/webhook", async (req, res) => {
       const baseHtml = await readCurrentHtml(itemId, meta);
 
       if (!baseHtml) {
-        console.log(`[agent] No prior draft on ${itemId} — generating first proof from @agent request`);
+        console.log(`[agent] No prior draft on ${itemId} — generating first proof from @MEG request`);
         const templateName = await resolveTemplateName(ticket);
         const html         = await generateHTML(ticket, templateName);
-        const fileName     = `${ticket.name.replace(/\s+/g, "_")}_${ticket.jobNumber || itemId}_v1.html`;
+        const fileName     = `${ticket.name.replace(/\s+/g, "_")}_v1.html`;
 
-        await uploadToMonday(itemId, fileName, html);
+        const asset = await uploadToMonday(itemId, fileName, html);
         await persistAgentState(itemId, 1, [], html);
         await setStatus(itemId, "Proofing");
+        await recordProofVersion(itemId, { version: 1, fileName, assetUrl: asset?.url });
 
         const questions = await analyzeForQuestions(ticket, parseInstructions(ticket.instructions), html);
         const reqId    = await findUserIdByName(ticket.requestor);
@@ -239,12 +241,12 @@ app.post("/api/webhook", async (req, res) => {
         const reqTag   = reqId ? `<strong>@${reqName}</strong> ` : "";
         await postUpdate(itemId,
           `<p>${reqTag}Your email proof (v1) is ready and attached to this item's Files. ` +
-          `Review it and reply with <strong>@agent</strong> followed by any changes you'd like. ` +
+          `Review it and reply with <strong>@MEG</strong> followed by any changes you'd like. ` +
           `When it's ready, set Status to <strong>Approved</strong>.</p>` +
           renderQuestionsBlock(questions),
           reqId ? [reqId] : []
         );
-        console.log(`[agent] Item ${itemId} v1 complete (via @agent)${questions.length ? ` (${questions.length} question(s) posted)` : ""}`);
+        console.log(`[agent] Item ${itemId} v1 complete (via @MEG)${questions.length ? ` (${questions.length} question(s) posted)` : ""}`);
         return;
       }
 
@@ -255,17 +257,18 @@ app.post("/api/webhook", async (req, res) => {
         { variant: designVariant(reviseTemplate) }
       );
       const newRev   = (meta.revision || 1) + 1;
-      const fileName = `${ticket.name.replace(/\s+/g, "_")}_${ticket.jobNumber || itemId}_v${newRev}.html`;
+      const fileName = `${ticket.name.replace(/\s+/g, "_")}_v${newRev}.html`;
 
-      await uploadToMonday(itemId, fileName, revised);
+      const revAsset = await uploadToMonday(itemId, fileName, revised);
       await persistAgentState(itemId, newRev, [...(meta.history || []), feedback], revised);
+      await recordProofVersion(itemId, { version: newRev, fileName, assetUrl: revAsset?.url });
 
       const requestorId = await findUserIdByName(ticket.requestor);
       const mentionName = ticket.requestor.split(",")[0].trim();
       const mentionTag  = requestorId ? `<strong>@${mentionName}</strong> ` : "";
       await postUpdate(itemId,
         `<p>${mentionTag}Updated proof (v${newRev}) is attached with your requested changes. ` +
-        `Reply with <strong>@agent</strong> for more edits, or set Status to <strong>Approved</strong> when ready.</p>`,
+        `Reply with <strong>@MEG</strong> for more edits, or set Status to <strong>Approved</strong> when ready.</p>`,
         requestorId ? [requestorId] : []
       );
       console.log(`[agent] Item ${itemId} revised to v${newRev}`);

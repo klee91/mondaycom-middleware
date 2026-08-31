@@ -2,7 +2,7 @@
  * helpers/monday-state.js — proof upload, agent-state persistence/recovery, ticket updates.
  */
 const FormData = require("form-data");
-const { fetch, MONDAY_FILE_URL, BOARD_ID, AGENT_STATE_COLUMN } = require("./config");
+const { fetch, MONDAY_FILE_URL, BOARD_ID, AGENT_STATE_COLUMN, PROOF_HISTORY_COLUMN } = require("./config");
 const { mondayQuery, fetchTicketFiles, downloadMondayAsset } = require("./monday");
 
 async function uploadToMonday(itemId, fileName, content, contentType = "text/html") {
@@ -88,6 +88,38 @@ async function persistAgentState(itemId, revision, history, currentHtml) {
 // change_simple_column_value, which for a status column matches the label text.
 // The label must exist on the board's Status column exactly as given. Any
 // failure is logged and swallowed so it never blocks proof delivery.
+// Append one line to the Proof History long-text column: version, timestamp,
+// filename, and a link to the uploaded asset. Reads the current value and
+// appends so the column becomes a running, newest-last history. No-op (and
+// never throws) when PROOF_HISTORY_COLUMN isn't configured or anything fails,
+// so it can't block proof delivery.
+async function recordProofVersion(itemId, { version, fileName, assetUrl }) {
+  if (!PROOF_HISTORY_COLUMN) return;
+  try {
+    // Read the current history text.
+    const data = await mondayQuery(`
+      query ProofHistory($itemId: ID!, $col: String!) {
+        items(ids: [$itemId]) { column_values(ids: [$col]) { text } }
+      }
+    `, { itemId, col: PROOF_HISTORY_COLUMN }, "2025-07");
+    const existing = data?.items?.[0]?.column_values?.[0]?.text || "";
+
+    const stamp = new Date().toISOString().replace("T", " ").slice(0, 16) + " UTC";
+    const link  = assetUrl ? ` — ${assetUrl}` : "";
+    const line  = `v${version} · ${stamp} · ${fileName}${link}`;
+    const next  = existing ? `${existing}\n${line}` : line;
+
+    await mondayQuery(`
+      mutation SetProofHistory($itemId: ID!, $boardId: ID!, $val: String!) {
+        change_simple_column_value(item_id: $itemId, board_id: $boardId, column_id: "${PROOF_HISTORY_COLUMN}", value: $val) { id }
+      }
+    `, { itemId, boardId: BOARD_ID, val: next });
+    console.log(`[agent] Item ${itemId} proof history updated (v${version})`);
+  } catch (err) {
+    console.warn(`[agent] Could not update proof history for ${itemId}: ${err.message}`);
+  }
+}
+
 async function setStatus(itemId, label) {
   try {
     await mondayQuery(`
@@ -119,4 +151,4 @@ async function findUserIdByName(name) {
   return match ? match.id : null;
 }
 
-module.exports = { uploadToMonday, readAgentMeta, readCurrentHtml, persistAgentState, postUpdate, setStatus, findUserIdByName };
+module.exports = { uploadToMonday, readAgentMeta, readCurrentHtml, persistAgentState, postUpdate, setStatus, recordProofVersion, findUserIdByName };

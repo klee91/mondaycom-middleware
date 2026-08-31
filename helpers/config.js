@@ -21,6 +21,11 @@ const BOARD_ID        = process.env.BOARD_ID;
 const AGENT_STATE_COLUMN  = "long_text_mm4b1t9h"; // Agent State column
 const INSTRUCTIONS_COLUMN = "long_text_mm47njms"; // Prompt column (display name may be "Prompt"; ID unchanged)
 const TEMPLATE_COLUMN     = "dropdown_mm4d2e9v";  // Template dropdown column
+// Proof History: a long-text column that accumulates one line per uploaded
+// version (timestamp + filename + asset link). Set PROOF_HISTORY_COLUMN in the
+// environment to the real column ID; if unset, proof-history recording is a
+// no-op (never blocks generation).
+const PROOF_HISTORY_COLUMN = process.env.PROOF_HISTORY_COLUMN || "";
 
 const CONTENT_VARIABLES = ["PreheaderText", "Subject", "Partner"];
 
@@ -64,6 +69,6 @@ TONE: professional, clear, appropriate for accounting and finance professionals.
 module.exports = {
   fetch, anthropic, GEN_MODEL, CHEAP_MODEL,
   MONDAY_API_URL, MONDAY_FILE_URL, BOARD_ID,
-  AGENT_STATE_COLUMN, INSTRUCTIONS_COLUMN, TEMPLATE_COLUMN,
+  AGENT_STATE_COLUMN, INSTRUCTIONS_COLUMN, TEMPLATE_COLUMN, PROOF_HISTORY_COLUMN,
   CONTENT_VARIABLES, BUTTON_COLORS, CACHE_TTL_MS, AI_SYSTEM_PROMPT,
 };

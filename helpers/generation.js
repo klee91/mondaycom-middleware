@@ -120,7 +120,7 @@ async function analyzeForQuestions(ticket, vars, generatedHtml) {
 function renderQuestionsBlock(questions) {
   if (!questions || questions.length === 0) return "";
   const items = questions.map(q => `<li>${q}</li>`).join("");
-  return `<p>Before this is final, a few things to confirm — reply with <strong>@agent</strong> and the answers:</p><ul>${items}</ul>`;
+  return `<p>Before this is final, a few things to confirm — reply with <strong>@MEG</strong> and the answers:</p><ul>${items}</ul>`;
 }
 
 // ═════════════════════════════════════════════
