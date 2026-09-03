@@ -30,7 +30,7 @@ const { getManifest } = require("./helpers/github-store");
 const { designVariant } = require("./helpers/design");
 const { parseInstructions } = require("./helpers/instructions");
 const {
-  mondayQuery, normalizeTicket, fetchItemById, fetchTicketFiles, fetchWordDocContent,
+  mondayQuery, normalizeTicket, fetchItemById, fetchTicketFiles, fetchWordDocContent, fetchAllItemFiles,
 } = require("./helpers/monday");
 const {
   uploadToMonday, readAgentMeta, readCurrentHtml, persistAgentState, postUpdate, setStatus, recordProofVersion, findUserIdByName,
@@ -44,6 +44,35 @@ app.use(cors({ origin: "*", methods: ["GET", "POST", "OPTIONS"], allowedHeaders:
 app.options("*", cors());
 app.use(express.json({ limit: "10mb" }));
 app.use((req, res, next) => { res.setHeader("Access-Control-Allow-Origin", "*"); next(); });
+
+// ═════════════════════════════════════════════
+// Doc gate — the universal precondition for generation
+// ═════════════════════════════════════════════
+// A readable Word .docx is the SINGLE trigger for building an email. No matter
+// the entry point (ticket creation, @MEG mention, manual endpoint), generation
+// must not proceed without one. Returns the extracted doc content when present,
+// or null when absent. When notify=true and absent, posts a precise message to
+// the requestor explaining what to do. retry=true waits for a just-uploaded
+// file to finish registering.
+async function requireDoc(itemId, { notify = false, retry = true } = {}) {
+  const doc = await fetchWordDocContent(itemId, { retry });
+  if (doc) return doc;
+  if (notify) {
+    const found = (await fetchAllItemFiles(itemId).catch(() => []))
+      .map(f => f.name)
+      .filter(n => !/^agent_state_.*\.json$/i.test(n) && !/_v\d+\.html$/i.test(n)); // hide the agent's own files
+    await postUpdate(itemId,
+      `<p>I can't start an email draft without a Word document (<strong>.docx</strong>) to build from. ` +
+      (found.length
+        ? `I can see these attached: ${found.map(n => `<em>${n}</em>`).join(", ")}, but none is a readable .docx in the <strong>Files column</strong>. `
+        : `Nothing readable is attached to the <strong>Files column</strong>. `) +
+      `If the document is in the <strong>Files gallery</strong>, please move it to the <strong>Files column</strong> ` +
+      `(the file cell on the item's row) — automation can't read the gallery. ` +
+      `Then reply <strong>@MEG</strong> to generate.</p>`).catch(() => {});
+    console.log(`[agent] Item ${itemId} — generation blocked: no readable .docx. Visible non-agent files: [${found.join(", ") || "∅"}].`);
+  }
+  return null;
+}
 
 // ═════════════════════════════════════════════
 // ROUTES
@@ -120,6 +149,13 @@ app.post("/api/generate", async (req, res) => {
   const { ticket, templateName } = req.body;
   if (!ticket || !templateName) return res.status(400).json({ error: "Missing ticket or templateName" });
   try {
+    // Universal gate: a readable .docx is required to build an email. For a real
+    // item, verify one is attached before generating. (Skip the check only for
+    // synthetic/manual tickets with no id, e.g. local template previews.)
+    if (ticket.id && ticket.id !== "manual") {
+      const doc = await requireDoc(ticket.id, { notify: false, retry: false });
+      if (!doc) return res.status(422).json({ error: "No readable .docx attached to the item's Files column — cannot generate." });
+    }
     const html = await generateHTML(ticket, templateName);
     res.json({ html });
   } catch (err) {
@@ -186,15 +222,13 @@ app.post("/api/webhook", async (req, res) => {
     if (event.type === "create_pulse") {
       const itemId = String(event.pulseId);
 
-      // At ticket creation, only auto-run if a Word doc is already attached.
-      // Requestors often create placeholder tickets before content is ready, so
-      // prompt text alone (which may just be a placeholder) is NOT enough to
-      // start generation. If there's no doc, do nothing and wait — the
-      // requestor kicks it off later by tagging @MEG. Check this FIRST so empty
-      // placeholder tickets bail out immediately (no job-number retry delay).
-      const hasDoc = await fetchWordDocContent(itemId);
-      if (!hasDoc) {
-        console.log(`[agent] Item ${itemId} created without a Word doc — waiting for a doc or an @MEG tag before generating.`);
+      // Generation requires a readable .docx — the universal trigger. At
+      // creation we BLOCK silently if it's missing (placeholder tickets stay
+      // quiet — no comment). The requestor kicks off generation later with an
+      // @MEG tag, which is where a missing-doc gets an explanatory reply.
+      const doc = await requireDoc(itemId, { notify: false, retry: false });
+      if (!doc) {
+        console.log(`[agent] Item ${itemId} created without a readable .docx — staying quiet, waiting for doc + @MEG.`);
         return;
       }
 
@@ -278,33 +312,20 @@ app.post("/api/webhook", async (req, res) => {
       const meta     = await readAgentMeta(itemId);
       const baseHtml = await readCurrentHtml(itemId, meta);
 
-      // A "regenerate" / "start over" instruction forces a FRESH build from the
-      // source document, discarding the existing draft. Without this, any @MEG
-      // on an item that already has a draft is treated as a revision (which edits
-      // the current HTML and never re-reads the doc).
-      const forceRegen = /^(re-?generate|re-?build|re-?do|start over|from scratch)\b/i.test(feedback);
+      // Routing is purely: no draft yet → generate a first proof from the doc;
+      // a draft already exists → revise it. (There is intentionally no
+      // requestor "regenerate" command — requestors only ever kick off the first
+      // proof or request revisions.)
+      if (!baseHtml) {
+        console.log(`[agent] No prior draft on ${itemId} — checking for a document to build from.`);
 
-      if (!baseHtml || forceRegen) {
-        console.log(`[agent] ${forceRegen ? "Regenerate requested" : "No prior draft"} on ${itemId} — generating fresh proof from the document.`);
-
-        // Warn early if no readable doc is attached. The item "Files Gallery" is
-        // NOT reliably reachable via the API — only the Files COLUMN is — so if a
-        // requestor put the doc in the gallery, we won't see it and would
-        // generate from placeholder copy. Tell them where to put it.
-        const docCheck = await fetchWordDocContent(itemId, { retry: true });
-        if (!docCheck) {
-          await postUpdate(itemId,
-            `<p>I couldn't find a Word document to build from. If you attached one to the ` +
-            `<strong>Files gallery</strong>, please add it to the <strong>Files column</strong> on the ` +
-            `item instead (the file cell on the row) — the gallery isn't readable by automation. ` +
-            `Then reply <strong>@MEG regenerate</strong>.</p>`);
-          console.log(`[agent] Item ${itemId} — no readable doc (likely in Files gallery, not the Files column). Asked requestor to move it.`);
-          return;
-        }
+        // Universal gate: no readable .docx → no draft. Notify the requestor.
+        const doc = await requireDoc(itemId, { notify: true, retry: true });
+        if (!doc) return;
 
         const templateName = await resolveTemplateName(ticket);
         const html         = await generateHTML(ticket, templateName);
-        const version      = forceRegen ? (meta.revision || 1) + 1 : 1;
+        const version      = 1;
         const fileName     = `${ticket.name.replace(/\s+/g, "_")}_v${version}.html`;
 
         const asset = await uploadToMonday(itemId, fileName, html);
