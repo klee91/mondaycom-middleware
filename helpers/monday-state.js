@@ -2,7 +2,7 @@
  * helpers/monday-state.js — proof upload, agent-state persistence/recovery, ticket updates.
  */
 const FormData = require("form-data");
-const { fetch, MONDAY_FILE_URL, BOARD_ID, AGENT_STATE_COLUMN, PROOF_HISTORY_COLUMN } = require("./config");
+const { fetch, MONDAY_FILE_URL, BOARD_ID, AGENT_STATE_COLUMN, PROOF_HISTORY_COLUMN, FILES_COLUMN, STATUS_COLUMN } = require("./config");
 const { mondayQuery, fetchTicketFiles, downloadMondayAsset } = require("./monday");
 
 async function uploadToMonday(itemId, fileName, content, contentType = "text/html") {
@@ -13,7 +13,7 @@ async function uploadToMonday(itemId, fileName, content, contentType = "text/htm
   `;
   const form = new FormData();
   form.append("query", query);
-  form.append("variables", JSON.stringify({ itemId, columnId: "files", file: null }));
+  form.append("variables", JSON.stringify({ itemId, columnId: FILES_COLUMN, file: null }));
   form.append("map", JSON.stringify({ "0": ["variables.file"] }));
   const buf = Buffer.from(content, "utf-8");
   form.append("0", buf, { filename: fileName, contentType, knownLength: buf.length });
@@ -124,7 +124,7 @@ async function setStatus(itemId, label) {
   try {
     await mondayQuery(`
       mutation SetStatus($itemId: ID!, $boardId: ID!, $label: String!) {
-        change_simple_column_value(item_id: $itemId, board_id: $boardId, column_id: "status", value: $label) { id }
+        change_simple_column_value(item_id: $itemId, board_id: $boardId, column_id: "${STATUS_COLUMN}", value: $label) { id }
       }
     `, { itemId, boardId: BOARD_ID, label });
     console.log(`[agent] Item ${itemId} status set to "${label}"`);

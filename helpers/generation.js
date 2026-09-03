@@ -168,7 +168,7 @@ async function generateHTML(ticket, templateName) {
   //    runs BEFORE applyVariables to avoid disturbing article markers. ──
   if (isDesignTemplate(templateName)) {
     const docContent = (ticket.id && ticket.id !== "manual")
-      ? await fetchWordDocContent(ticket.id) : null;
+      ? await fetchWordDocContent(ticket.id, { retry: true }) : null;
     const sourceContent = docContent?.html || vars["BodyContent"] || vars["__freeform__"] || "";
     // Only pass __freeform__ as *separate* instructions when it isn't already
     // the source, so it isn't duplicated into the prompt twice.
@@ -196,7 +196,7 @@ async function generateHTML(ticket, templateName) {
 
   let docContent = null;
   if (stillMissing.includes("BodyContent") && ticket.id && ticket.id !== "manual") {
-    docContent = await fetchWordDocContent(ticket.id);
+    docContent = await fetchWordDocContent(ticket.id, { retry: true });
   }
 
   if (stillMissing.length > 0) {

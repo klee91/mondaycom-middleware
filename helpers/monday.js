@@ -2,7 +2,7 @@
  * helpers/monday.js — Monday GraphQL, ticket/file reads, Word-doc extraction, header image.
  */
 const mammoth = require("mammoth");
-const { fetch, MONDAY_API_URL, BOARD_ID, AGENT_STATE_COLUMN, INSTRUCTIONS_COLUMN, TEMPLATE_COLUMN } = require("./config");
+const { fetch, MONDAY_API_URL, BOARD_ID, AGENT_STATE_COLUMN, INSTRUCTIONS_COLUMN, TEMPLATE_COLUMN, FILES_COLUMN, STATUS_COLUMN } = require("./config");
 
 async function mondayQuery(query, variables = {}, apiVersion = "2024-01") {
   const res = await fetch(MONDAY_API_URL, {
@@ -40,7 +40,7 @@ function normalizeTicket(item) {
     instructions: cols[INSTRUCTIONS_COLUMN]  || "",
     agentState:   cols[AGENT_STATE_COLUMN]   || "",
     template:     cols[TEMPLATE_COLUMN]       || "",
-    hasFiles:     !!cols["files"],
+    hasFiles:     !!cols[FILES_COLUMN],
   };
 }
 
@@ -52,7 +52,7 @@ async function fetchItemById(itemId) {
         column_values(ids: [
           "status","long_text7","text86","formula",
           "date4","date_mkx4g1zc","dropdown3",
-          "status_1","dropdown2","person","files","${INSTRUCTIONS_COLUMN}","${AGENT_STATE_COLUMN}","${TEMPLATE_COLUMN}"
+          "status_1","dropdown2","person","${FILES_COLUMN}","${INSTRUCTIONS_COLUMN}","${AGENT_STATE_COLUMN}","${TEMPLATE_COLUMN}"
         ]) {
           id text value
           ... on FormulaValue { display_value }
@@ -102,6 +102,111 @@ async function fetchTicketFiles(itemId) {
   return data?.items?.[0]?.assets ?? [];
 }
 
+// Read the Files COLUMN directly. The item-level `assets` collection above is
+// unreliable for files sitting in a specific files column — Monday has a
+// long-standing quirk where `items { assets }` can return only one (or none) of
+// the column's files. Querying the FileValue column value returns the column's
+// attachments reliably. Returns the same shape as fetchTicketFiles
+// ({ id, name, url, public_url, file_extension }) so callers are interchangeable.
+async function fetchFilesColumnAssets(itemId) {
+  try {
+    const data = await mondayQuery(`
+      query GetFilesColumn($itemId: ID!, $filesCol: String!) {
+        items(ids: [$itemId]) {
+          column_values(ids: [$filesCol]) {
+            ... on FileValue {
+              files {
+                ... on FileAssetValue {
+                  asset_id
+                  name
+                  asset { id name url public_url file_extension }
+                }
+                ... on FileDocValue { file_id url }
+                ... on FileLinkValue { file_id name url }
+              }
+            }
+          }
+        }
+      }
+    `, { itemId, filesCol: FILES_COLUMN }, "2025-07");
+    const files = data?.items?.[0]?.column_values?.[0]?.files ?? [];
+    // Log the raw subtype breakdown so a doc attached as a monday-doc/link
+    // (not an uploaded asset) is visible rather than silently dropped.
+    if (files.length) {
+      console.log(`[files] item ${itemId} files-column raw: ${JSON.stringify(files).slice(0, 400)}`);
+    }
+    return files.map(f => {
+      // FileAssetValue → has asset{}. FileDocValue/FileLinkValue → have url but
+      // no downloadable asset; surface name/url so at least the type is visible.
+      const name = f.name || f.asset?.name || (f.url ? f.url.split("/").pop() : "") || "";
+      return {
+        id:            f.asset?.id || f.asset_id || f.file_id,
+        name,
+        url:           f.asset?.url || f.url || "",
+        public_url:    f.asset?.public_url || "",
+        file_extension: f.asset?.file_extension || "",
+        _kind:         f.asset ? "asset" : (f.file_id ? "doc_or_link" : "unknown"),
+      };
+    }).filter(a => a.name);
+  } catch (err) {
+    console.warn(`[agent] files-column read failed for ${itemId}: ${err.message}`);
+    return [];
+  }
+}
+
+// Merge both sources (column-scoped first — most reliable — then item assets),
+// de-duplicated by id/name. This is what doc/image lookups should use.
+// Read files attached to the item's UPDATES (comments/replies). Neither the
+// files column nor items.assets surfaces these, so this is a distinct source.
+async function fetchUpdateAssets(itemId) {
+  try {
+    const data = await mondayQuery(`
+      query GetUpdateAssets($itemId: ID!) {
+        items(ids: [$itemId]) {
+          updates(limit: 50) {
+            assets { id name url public_url file_extension }
+          }
+        }
+      }
+    `, { itemId }, "2025-07");
+    const updates = data?.items?.[0]?.updates ?? [];
+    const files = [];
+    for (const u of updates) for (const a of (u.assets ?? [])) files.push(a);
+    return files.filter(a => a.name);
+  } catch (err) {
+    console.warn(`[agent] update-assets read failed for ${itemId}: ${err.message}`);
+    return [];
+  }
+}
+
+// Best-effort read across EVERY Monday surface we can reach: the Files column,
+// the item's aggregate assets, and update attachments. NOTE: the item "Files
+// Gallery" is NOT reliably exposed by the API — if a doc is only in the gallery,
+// none of these will see it, and the caller should tell the requestor to use the
+// Files column instead.
+async function fetchAllItemFiles(itemId) {
+  const [colFiles, assetFiles, updateFiles] = await Promise.all([
+    fetchFilesColumnAssets(itemId),
+    fetchTicketFiles(itemId).catch(() => []),
+    fetchUpdateAssets(itemId).catch(() => []),
+  ]);
+  // Diagnostic: show exactly what each source returned.
+  console.log(
+    `[files] item ${itemId}: files-column [${colFiles.map(f => f.name).join(", ") || "∅"}] ; ` +
+    `assets [${assetFiles.map(f => f.name).join(", ") || "∅"}] ; ` +
+    `updates [${updateFiles.map(f => f.name).join(", ") || "∅"}]`
+  );
+  const seen = new Set();
+  const merged = [];
+  for (const f of [...colFiles, ...assetFiles, ...updateFiles]) {
+    const key = String(f.id || f.name);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(f);
+  }
+  return merged;
+}
+
 async function downloadMondayAsset(asset) {
   const src = asset.public_url || asset.url;
   const res = await fetch(src);
@@ -109,10 +214,25 @@ async function downloadMondayAsset(asset) {
   return Buffer.from(await res.arrayBuffer());
 }
 
-async function fetchWordDocContent(itemId) {
+async function fetchWordDocContent(itemId, { retry = false } = {}) {
   try {
-    const assets = await fetchTicketFiles(itemId);
-    const doc = assets.find(a => /\.docx?$/i.test(a.name || ""));
+    // Monday populates an item's `assets` asynchronously after an upload
+    // finishes processing. When a requestor attaches a doc and immediately tags
+    // @MEG, the first read can miss the just-added file. With retry=true we wait
+    // a couple of times before concluding there's no doc. (Same rationale as the
+    // Job Number formula retry.) The creation-time gate passes retry=false so
+    // empty placeholder tickets bail out immediately.
+    let doc = null;
+    const delays = retry ? [0, 2500, 2500] : [0]; // ~5s across 3 attempts when retrying
+    for (let attempt = 0; attempt < delays.length; attempt++) {
+      if (delays[attempt]) await new Promise(r => setTimeout(r, delays[attempt]));
+      const assets = await fetchAllItemFiles(itemId);
+      doc = assets.find(a => /\.docx?$/i.test(a.name || ""));
+      if (doc) break;
+      if (retry && attempt < delays.length - 1) {
+        console.log(`[agent] No .docx yet in Files for ${itemId} (attempt ${attempt + 1}/${delays.length}) — retrying after delay in case the upload is still registering.`);
+      }
+    }
     if (!doc) return null;
     if (/\.doc$/i.test(doc.name)) {
       console.warn(`Legacy .doc not supported ("${doc.name}") — ask the requestor to attach a .docx.`);
@@ -217,7 +337,7 @@ async function applyHeaderImage(html, itemId, vars = {}) {
   try {
     let match = null;
     if (hasImageSignal) {
-      const assets = await fetchTicketFiles(itemId);
+      const assets = await fetchAllItemFiles(itemId);
       const resolved = resolveHeaderAsset(assets, vars);
       match = resolved.match;
       if (!match) {
@@ -246,4 +366,4 @@ async function applyHeaderImage(html, itemId, vars = {}) {
   }
 }
 
-module.exports = { mondayQuery, normalizeTicket, fetchItemById, fetchItemColumns, fetchTicketFiles, downloadMondayAsset, fetchWordDocContent, resolveHeaderAsset, replaceFirstImage, applyHeaderImage };
+module.exports = { mondayQuery, normalizeTicket, fetchItemById, fetchItemColumns, fetchTicketFiles, fetchFilesColumnAssets, fetchAllItemFiles, downloadMondayAsset, fetchWordDocContent, resolveHeaderAsset, replaceFirstImage, applyHeaderImage };

@@ -24,7 +24,7 @@ const express = require("express");
 const cors    = require("cors");
 const path    = require("path");
 
-const { BOARD_ID, INSTRUCTIONS_COLUMN, AGENT_STATE_COLUMN, TEMPLATE_COLUMN } = require("./helpers/config");
+const { BOARD_ID, INSTRUCTIONS_COLUMN, AGENT_STATE_COLUMN, TEMPLATE_COLUMN, FILES_COLUMN, STATUS_COLUMN } = require("./helpers/config");
 const { getSharePointToken, fetchTemplateIndex } = require("./helpers/sharepoint");
 const { getManifest } = require("./helpers/github-store");
 const { designVariant } = require("./helpers/design");
@@ -93,7 +93,7 @@ app.get("/api/tickets", async (req, res) => {
                 column_values(ids: [
                   "status","long_text7","text86","formula",
                   "date4","date_mkx4g1zc","dropdown3",
-                  "status_1","dropdown2","person","files","${INSTRUCTIONS_COLUMN}","${AGENT_STATE_COLUMN}","${TEMPLATE_COLUMN}"
+                  "status_1","dropdown2","person","${FILES_COLUMN}","${INSTRUCTIONS_COLUMN}","${AGENT_STATE_COLUMN}","${TEMPLATE_COLUMN}"
                 ]) {
                   id text value
                   ... on FormulaValue { display_value }
@@ -141,12 +141,37 @@ app.post("/api/upload", async (req, res) => {
 });
 
 // POST /api/webhook — stateful agent
+// In-memory de-duplication of webhook deliveries. Monday can deliver the same
+// event more than once (duplicate subscriptions, at-least-once delivery), which
+// otherwise produces multiple proofs from a single action. We fingerprint each
+// event and skip any repeat seen within the TTL window. In-memory is sufficient
+// here (single Render instance); if scaled to multiple instances this would need
+// shared storage.
+const recentEvents = new Map(); // fingerprint -> timestamp
+const DEDUP_TTL_MS = 60 * 1000;
+function isDuplicateEvent(event) {
+  // Fingerprint: type + item + the salient payload (update text / column).
+  const body = (event.body || event.textBody || "").replace(/<[^>]+>/g, "").trim().slice(0, 120);
+  const fp = `${event.type}:${event.pulseId}:${event.columnId || ""}:${body}`;
+  const now = Date.now();
+  // prune old entries
+  for (const [k, t] of recentEvents) if (now - t > DEDUP_TTL_MS) recentEvents.delete(k);
+  if (recentEvents.has(fp)) return true;
+  recentEvents.set(fp, now);
+  return false;
+}
+
 app.post("/api/webhook", async (req, res) => {
   const { challenge, event } = req.body;
   if (challenge) return res.json({ challenge });
   if (!event) return res.json({ status: "ignored" });
 
   res.json({ status: "received" });
+
+  if (isDuplicateEvent(event)) {
+    console.log(`[agent] Duplicate ${event.type} for ${event.pulseId} within ${DEDUP_TTL_MS / 1000}s — skipping (likely duplicate webhook delivery/subscription).`);
+    return;
+  }
   console.log(`[agent] event=${event.type} pulseId=${event.pulseId} boardId=${event.boardId}`);
 
   // Keep the template manifest in sync with the SharePoint folder. getManifest()
@@ -208,15 +233,39 @@ app.post("/api/webhook", async (req, res) => {
 
     if (event.type === "create_update") {
       const itemId = String(event.pulseId);
-      const body   = (event.body || event.textBody || "").trim();
-      const plain  = body.replace(/<[^>]+>/g, "").trim();
+      const rawBody = event.body || event.textBody || "";
+      console.log(`[agent] update raw body on ${itemId}: ${JSON.stringify(rawBody).slice(0, 300)}`);
+      const plain = rawBody.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
 
-      if (!/^@(MEG|agent)\b/i.test(plain)) {
-        console.log(`[agent] Update on ${itemId} ignored (no @MEG prefix)`);
+      // GUARD 1 — never act on the agent's OWN comments. Its posts contain these
+      // signatures (and themselves mention @MEG), which would otherwise
+      // re-trigger generation in a loop.
+      const SELF_MARKERS = [
+        "Your email proof",
+        "Before this is final",
+        "reply with @MEG and the answers",
+        "Updated proof (v",
+        "is ready and attached to this item",
+      ];
+      if (SELF_MARKERS.some(m => plain.includes(m))) {
+        console.log(`[agent] Update on ${itemId} is the agent's own comment — ignoring (self-reply guard).`);
         return;
       }
-      const feedback = plain.replace(/^@(MEG|agent)\b[:,\s]*/i, "").trim();
-      if (!feedback) return;
+
+      // GUARD 2 — the trigger must be at the START of the comment. Monday wraps
+      // a mention as <span>@MEG</span>, so strip a leading zero-width char /
+      // whitespace and require @MEG|@agent as the first token. This deliberately
+      // does NOT match @MEG appearing mid-sentence (which is how the agent's own
+      // replies reference it), only a genuine leading mention the requestor typed.
+      const leading = plain.replace(/^[\uFEFF\u200B\s]+/, "");
+      if (!/^@(MEG|agent)\b/i.test(leading)) {
+        console.log(`[agent] Update on ${itemId} ignored (no leading @MEG mention). Stripped: "${leading.slice(0, 120)}"`);
+        return;
+      }
+      const feedback = leading.replace(/^@(MEG|agent)\b[:,\s]*/i, "").trim();
+      if (!feedback) {
+        console.log(`[agent] @MEG mention on ${itemId} had no instruction text after it — treating as a bare trigger.`);
+      }
 
       console.log(`[agent] Feedback on ${itemId}: "${feedback}"`);
       const ticket = await fetchItemById(itemId);
@@ -229,33 +278,63 @@ app.post("/api/webhook", async (req, res) => {
       const meta     = await readAgentMeta(itemId);
       const baseHtml = await readCurrentHtml(itemId, meta);
 
-      if (!baseHtml) {
-        console.log(`[agent] No prior draft on ${itemId} — generating first proof from @MEG request`);
+      // A "regenerate" / "start over" instruction forces a FRESH build from the
+      // source document, discarding the existing draft. Without this, any @MEG
+      // on an item that already has a draft is treated as a revision (which edits
+      // the current HTML and never re-reads the doc).
+      const forceRegen = /^(re-?generate|re-?build|re-?do|start over|from scratch)\b/i.test(feedback);
+
+      if (!baseHtml || forceRegen) {
+        console.log(`[agent] ${forceRegen ? "Regenerate requested" : "No prior draft"} on ${itemId} — generating fresh proof from the document.`);
+
+        // Warn early if no readable doc is attached. The item "Files Gallery" is
+        // NOT reliably reachable via the API — only the Files COLUMN is — so if a
+        // requestor put the doc in the gallery, we won't see it and would
+        // generate from placeholder copy. Tell them where to put it.
+        const docCheck = await fetchWordDocContent(itemId, { retry: true });
+        if (!docCheck) {
+          await postUpdate(itemId,
+            `<p>I couldn't find a Word document to build from. If you attached one to the ` +
+            `<strong>Files gallery</strong>, please add it to the <strong>Files column</strong> on the ` +
+            `item instead (the file cell on the row) — the gallery isn't readable by automation. ` +
+            `Then reply <strong>@MEG regenerate</strong>.</p>`);
+          console.log(`[agent] Item ${itemId} — no readable doc (likely in Files gallery, not the Files column). Asked requestor to move it.`);
+          return;
+        }
+
         const templateName = await resolveTemplateName(ticket);
         const html         = await generateHTML(ticket, templateName);
-        const fileName     = `${ticket.name.replace(/\s+/g, "_")}_v1.html`;
+        const version      = forceRegen ? (meta.revision || 1) + 1 : 1;
+        const fileName     = `${ticket.name.replace(/\s+/g, "_")}_v${version}.html`;
 
         const asset = await uploadToMonday(itemId, fileName, html);
-        await persistAgentState(itemId, 1, [], html);
+        await persistAgentState(itemId, version, [], html);
         await setStatus(itemId, "Proofing");
-        await recordProofVersion(itemId, { version: 1, fileName, assetUrl: asset?.url });
+        await recordProofVersion(itemId, { version, fileName, assetUrl: asset?.url });
 
         const questions = await analyzeForQuestions(ticket, parseInstructions(ticket.instructions), html);
         const reqId    = await findUserIdByName(ticket.requestor);
         const reqName  = ticket.requestor.split(",")[0].trim();
         const reqTag   = reqId ? `<strong>@${reqName}</strong> ` : "";
         await postUpdate(itemId,
-          `<p>${reqTag}Your email proof (v1) is ready and attached to this item's Files. ` +
+          `<p>${reqTag}Your email proof (v${version}) is ready and attached to this item's Files. ` +
           `Review it and reply with <strong>@MEG</strong> followed by any changes you'd like. ` +
           `When it's ready, set Status to <strong>Approved</strong>.</p>` +
           renderQuestionsBlock(questions),
           reqId ? [reqId] : []
         );
-        console.log(`[agent] Item ${itemId} v1 complete (via @MEG)${questions.length ? ` (${questions.length} question(s) posted)` : ""}`);
+        console.log(`[agent] Item ${itemId} v${version} complete (via @MEG)${questions.length ? ` (${questions.length} question(s) posted)` : ""}`);
         return;
       }
 
       const ticketVars = parseInstructions(ticket.instructions);
+      if (!feedback) {
+        console.log(`[agent] Bare @MEG on ${itemId} with an existing draft and no instructions — nothing to revise, skipping.`);
+        await postUpdate(itemId,
+          `<p>Tag <strong>@MEG</strong> followed by the change you'd like (e.g. "@MEG make the intro shorter"), ` +
+          `or set Status to <strong>Approved</strong> when the current proof is ready.</p>`);
+        return;
+      }
       const reviseTemplate = await resolveTemplateName(ticket);
       const revised  = await reviseHTML(
         baseHtml, feedback, meta.history || [], ticketVars["__freeform__"] || "",
@@ -280,7 +359,7 @@ app.post("/api/webhook", async (req, res) => {
       return;
     }
 
-    if (event.type === "update_column_value" && event.columnId === "status") {
+    if (event.type === "update_column_value" && event.columnId === STATUS_COLUMN) {
       const itemId = String(event.pulseId);
       const label  = event.value?.label?.text || event.value?.label || "";
       if ((label || "").toLowerCase() === "approved") {

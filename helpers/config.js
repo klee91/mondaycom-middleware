@@ -17,14 +17,17 @@ const MONDAY_API_URL  = "https://api.monday.com/v2";
 const MONDAY_FILE_URL = "https://api.monday.com/v2/file";
 const BOARD_ID        = process.env.BOARD_ID;
 
-// Monday column IDs
-const AGENT_STATE_COLUMN  = "long_text_mm4b1t9h"; // Agent State column
-const INSTRUCTIONS_COLUMN = "long_text_mm47njms"; // Prompt column (display name may be "Prompt"; ID unchanged)
-const TEMPLATE_COLUMN     = "dropdown_mm4d2e9v";  // Template dropdown column
-// Proof History: a long-text column that accumulates one line per uploaded
-// version (timestamp + filename + asset link). Set PROOF_HISTORY_COLUMN in the
-// environment to the real column ID; if unset, proof-history recording is a
-// no-op (never blocks generation).
+// Monday column IDs — these are PER-BOARD and differ between the dev and prod
+// boards, so they're environment-configurable. Set them in Render to match the
+// board this instance runs against. The defaults below are the prod board
+// (2120641399) values; override every one when pointing at the dev board.
+const AGENT_STATE_COLUMN   = process.env.AGENT_STATE_COLUMN   || "long_text_mm4b1t9h"; // Agent State
+const INSTRUCTIONS_COLUMN  = process.env.INSTRUCTIONS_COLUMN  || "long_text_mm47njms"; // Prompt
+const TEMPLATE_COLUMN      = process.env.TEMPLATE_COLUMN      || "dropdown_mm4d2e9v";  // Email Template dropdown
+const FILES_COLUMN         = process.env.FILES_COLUMN         || "files";              // Files column (doc/image attachments)
+const STATUS_COLUMN        = process.env.STATUS_COLUMN        || "status";             // Status
+// Proof History: long-text column accumulating one line per uploaded version.
+// Unset → proof-history recording is a no-op (never blocks generation).
 const PROOF_HISTORY_COLUMN = process.env.PROOF_HISTORY_COLUMN || "";
 
 const CONTENT_VARIABLES = ["PreheaderText", "Subject", "Partner"];
@@ -69,6 +72,6 @@ TONE: professional, clear, appropriate for accounting and finance professionals.
 module.exports = {
   fetch, anthropic, GEN_MODEL, CHEAP_MODEL,
   MONDAY_API_URL, MONDAY_FILE_URL, BOARD_ID,
-  AGENT_STATE_COLUMN, INSTRUCTIONS_COLUMN, TEMPLATE_COLUMN, PROOF_HISTORY_COLUMN,
+  AGENT_STATE_COLUMN, INSTRUCTIONS_COLUMN, TEMPLATE_COLUMN, FILES_COLUMN, STATUS_COLUMN, PROOF_HISTORY_COLUMN,
   CONTENT_VARIABLES, BUTTON_COLORS, CACHE_TTL_MS, AI_SYSTEM_PROMPT,
 };

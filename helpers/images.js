@@ -19,7 +19,7 @@
  * in Salesforce before send.
  */
 const { anthropic, CHEAP_MODEL } = require("./config");
-const { fetchTicketFiles } = require("./monday");
+const { fetchAllItemFiles } = require("./monday");
 
 const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|svg)$/i;
 
@@ -125,7 +125,7 @@ async function planImagePlacements(promptText, images, slots) {
 async function applyContentImages(html, itemId, vars = {}) {
   if (!itemId || itemId === "manual") return html;
   try {
-    const assets = await fetchTicketFiles(itemId);
+    const assets = await fetchAllItemFiles(itemId);
     const images = assets.filter(a => IMAGE_EXT_RE.test(a.name || "") && (a.public_url || a.url));
     if (images.length === 0) return html;
 
